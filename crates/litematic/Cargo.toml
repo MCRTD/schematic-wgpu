@@ -1,0 +1,11 @@
+[package]
+name = "litematic"
+version = "0.1.0"
+edition = "2024"
+description = "Parser for Litematica .litematic schematic files"
+
+[dependencies]
+fastnbt = "2.6.3"
+flate2 = "1.1.10"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"

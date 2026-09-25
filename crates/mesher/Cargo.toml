@@ -1,0 +1,14 @@
+[package]
+name = "mesher"
+version = "0.1.0"
+edition = "2024"
+description = "Build textured meshes from Litematica schematics"
+
+[dependencies]
+glam = "0.33.10"
+litematic = { path = "../litematic" }
+mc-assets = { path = "../mc-assets" }
+thiserror = "2.0.21"
+
+[dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }

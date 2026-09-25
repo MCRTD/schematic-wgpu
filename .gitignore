@@ -1,0 +1,5 @@
+/target
+*.litematic
+/.cache
+/crates/web/www/pkg
+*.Ds_store

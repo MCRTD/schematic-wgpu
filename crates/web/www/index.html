@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Schematic Viewer</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M8 1 15 5v6l-7 4-7-4V5z' fill='%236aa7ff'/><path d='M8 1 15 5 8 9 1 5z' fill='%23a9cbff'/></svg>">
+  <style>
+    :root {
+      --bg: #0b0d12;
+      --panel: rgb(20 23 30 / 0.92);
+      --border: #2a2f3a;
+      --text: #e6e8ee;
+      --muted: #9aa1b0;
+      --accent: #6aa7ff;
+      --warn: #f2b85b;
+      --error: #ff6b6b;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+      font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
+    canvas { display: block; width: 100vw; height: 100vh; outline: none; touch-action: none; }
+    #panel { position: fixed; top: 16px; left: 16px; width: min(340px, calc(100vw - 32px));
+      max-height: calc(100vh - 32px); overflow: auto; background: var(--panel); border: 1px solid var(--border);
+      border-radius: 10px; padding: 14px 16px; backdrop-filter: blur(6px); }
+    h1 { font-size: 15px; margin: 0 0 12px; }
+    label { display: block; color: var(--muted); font-size: 12px; margin: 12px 0 4px; }
+    select, button { width: 100%; padding: 7px 10px; border-radius: 6px; border: 1px solid var(--border);
+      background: #1b1f28; color: var(--text); font: inherit; }
+    button { cursor: pointer; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #08101f; font-weight: 600; }
+    button:disabled { opacity: 0.45; cursor: default; }
+    .row { display: flex; gap: 8px; }
+    .row > * { flex: 1; }
+    #drop { border: 1px dashed var(--border); border-radius: 8px; padding: 14px; text-align: center;
+      color: var(--muted); cursor: pointer; }
+    #drop.over { border-color: var(--accent); color: var(--text); }
+    #status { margin-top: 12px; color: var(--muted); font-size: 12px; white-space: pre-wrap; min-height: 1.4em; }
+    #status.error { color: var(--error); }
+    #report { margin-top: 8px; font-size: 12px; white-space: pre-wrap; }
+    #report .warn { color: var(--warn); }
+    #packs { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .hint, .legal { font-size: 11px; color: var(--muted); margin-top: 12px; }
+    #drag-veil { position: fixed; inset: 0; border: 3px dashed var(--accent); pointer-events: none; display: none; }
+    body.dragging #drag-veil { display: block; }
+  </style>
+</head>
+<body>
+  <canvas id="view" tabindex="0"></canvas>
+  <div id="drag-veil"></div>
+
+  <div id="panel">
+    <h1>Schematic Viewer</h1>
+
+    <div id="drop" role="button" tabindex="0">Drop a <b>.litematic</b> file here<br>or click to choose</div>
+    <input id="file" type="file" accept=".litematic" hidden>
+
+    <label for="version">Minecraft version (block models &amp; textures)</label>
+    <select id="version" disabled><option>Loading versions…</option></select>
+
+    <label>Resource packs (optional, stacked on top)</label>
+    <div class="row">
+      <button id="add-pack">Add .zip…</button>
+      <button id="clear-packs" disabled>Clear</button>
+    </div>
+    <input id="pack-file" type="file" accept=".zip,.jar" multiple hidden>
+    <div id="packs"></div>
+
+    <label>Export</label>
+    <div class="row">
+      <button id="export" class="primary" disabled>Download .glb</button>
+      <button id="export-fbx" disabled>Download .fbx</button>
+    </div>
+
+    <div id="status"></div>
+    <div id="report"></div>
+
+    <div class="hint">Drag to orbit · right-drag or shift-drag to pan · scroll to zoom · R to re-frame</div>
+    <div class="legal">Block assets are downloaded directly from Mojang's servers into your browser. Not an official Minecraft product; not affiliated with Mojang or Microsoft.</div>
+  </div>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>
