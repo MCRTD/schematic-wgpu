@@ -8,4 +8,4 @@ pub mod headless;
 mod renderer;
 
 pub use camera::OrbitCamera;
-pub use renderer::Renderer;
+pub use renderer::{Lighting, Renderer};

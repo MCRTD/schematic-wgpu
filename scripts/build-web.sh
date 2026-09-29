@@ -7,7 +7,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 profile="${PROFILE:-release}"
-cargo build -p web --target wasm32-unknown-unknown --profile "$profile"
+cargo build -p schematic-wgpu-web --target wasm32-unknown-unknown --profile "$profile"
 dir="$profile"
 [ "$profile" = dev ] && dir=debug
 bindgen="$(command -v wasm-bindgen || echo "${CARGO_HOME:-$HOME/.cargo}/bin/wasm-bindgen")"

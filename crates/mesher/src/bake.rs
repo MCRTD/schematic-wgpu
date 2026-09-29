@@ -17,6 +17,8 @@ pub struct Quad {
     /// Texture location, or `None` if the model's reference was unresolved.
     pub texture: Option<String>,
     pub tinted: bool,
+    /// Whether the model allows ambient occlusion (`"ambientocclusion"`).
+    pub ambient_occlusion: bool,
 }
 
 impl Quad {
@@ -148,6 +150,7 @@ pub fn bake(instance: &ModelInstance) -> Vec<Quad> {
                 cullface: cullface.map(rotate_dir),
                 texture: texture.clone(),
                 tinted: tintindex.is_some(),
+                ambient_occlusion: instance.model.ambient_occlusion,
             });
         }
     }

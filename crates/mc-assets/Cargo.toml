@@ -1,8 +1,11 @@
 [package]
-name = "mc-assets"
-version = "0.1.0"
-edition = "2024"
+name = "schematic-wgpu-mc-assets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Minecraft resource pack loading: blockstates, block models and textures"
+
 
 [dependencies]
 flate2 = "1.1.10"

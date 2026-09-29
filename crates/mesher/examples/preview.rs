@@ -3,7 +3,7 @@
 //! cargo run --release -p mesher --example preview -- <file.litematic> <out.png> <pack>... [--yaw 45] [--size 1024] [--xmax N]
 
 use glam::{Mat3, Vec2, Vec3};
-use mesher::{Mesh, MeshLayer, Mesher};
+use schematic_wgpu_mesher::{Mesh, MeshLayer, Mesher};
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();

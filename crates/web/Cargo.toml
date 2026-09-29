@@ -1,25 +1,28 @@
 [package]
-name = "web"
-version = "0.1.0"
-edition = "2024"
+name = "schematic-wgpu-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Browser front end: loads schematics and Mojang assets, shows the viewer"
 publish = false
 
 [lib]
+name = "web"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 console_error_panic_hook = "0.1.7"
 console_log = "1.1.0"
-export = { path = "../export" }
+export = { package = "schematic-wgpu-export", version = "0.1.0", path = "../export" }
 js-sys = "0.3.106"
-litematic = { path = "../litematic" }
+litematic = { package = "schematic-wgpu-litematic", version = "0.1.0", path = "../litematic" }
 log = "0.4.34"
-mc-assets = { path = "../mc-assets" }
-mesher = { path = "../mesher" }
+mc-assets = { package = "schematic-wgpu-mc-assets", version = "0.1.0", path = "../mc-assets" }
+mesher = { package = "schematic-wgpu-mesher", version = "0.1.0", path = "../mesher" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-viewer = { path = "../viewer" }
+viewer = { package = "schematic-wgpu-viewer", version = "0.1.0", path = "../viewer" }
 wasm-bindgen = "0.2.129"
 wasm-bindgen-futures = "0.4.79"
 web-sys = { version = "0.3.106", features = ["HtmlCanvasElement"] }

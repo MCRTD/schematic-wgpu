@@ -5,8 +5,8 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
-use mc_assets::remote_zip::{self, TAIL_LEN};
-use mc_assets::{AssetSource, ZipSource};
+use schematic_wgpu_mc_assets::remote_zip::{self, TAIL_LEN};
+use schematic_wgpu_mc_assets::{AssetSource, ZipSource};
 
 fn main() {
     let path = std::env::args().nth(1).expect("usage: remote_check <client.jar>");

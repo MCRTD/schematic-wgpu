@@ -1,14 +1,17 @@
 [package]
-name = "viewer"
-version = "0.1.0"
-edition = "2024"
+name = "schematic-wgpu-viewer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "wgpu renderer and interactive viewer for schematic meshes"
+
 
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
 glam = "0.33.10"
 log = "0.4.34"
-mesher = { path = "../mesher" }
+mesher = { package = "schematic-wgpu-mesher", version = "0.1.0", path = "../mesher" }
 wgpu = "30.0.1"
 winit = "0.30.13"
 

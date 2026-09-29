@@ -549,21 +549,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "export"
-version = "0.1.0"
-dependencies = [
- "flate2",
- "glam",
- "gltf",
- "image",
- "mesher",
- "pollster",
- "serde_json",
- "ufbx",
- "viewer",
-]
-
-[[package]]
 name = "fastnbt"
 version = "2.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1018,16 +1003,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
-name = "litematic"
-version = "0.1.0"
-dependencies = [
- "fastnbt",
- "flate2",
- "serde",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "litrs"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1049,18 +1024,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
-name = "mc-assets"
-version = "0.1.0"
-dependencies = [
- "flate2",
- "image",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "zip",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1073,17 +1036,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "mesher"
-version = "0.1.0"
-dependencies = [
- "glam",
- "image",
- "litematic",
- "mc-assets",
- "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1839,15 +1791,100 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "export",
  "glam",
  "image",
- "litematic",
- "mc-assets",
- "mesher",
  "pollster",
+ "schematic-wgpu-export",
+ "schematic-wgpu-litematic",
+ "schematic-wgpu-mc-assets",
+ "schematic-wgpu-mesher",
+ "schematic-wgpu-viewer",
  "serde_json",
- "viewer",
+]
+
+[[package]]
+name = "schematic-wgpu-export"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "glam",
+ "gltf",
+ "image",
+ "pollster",
+ "schematic-wgpu-mesher",
+ "schematic-wgpu-viewer",
+ "serde_json",
+ "ufbx",
+]
+
+[[package]]
+name = "schematic-wgpu-litematic"
+version = "0.1.0"
+dependencies = [
+ "fastnbt",
+ "flate2",
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "schematic-wgpu-mc-assets"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "image",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "zip",
+]
+
+[[package]]
+name = "schematic-wgpu-mesher"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "image",
+ "schematic-wgpu-litematic",
+ "schematic-wgpu-mc-assets",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "schematic-wgpu-viewer"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "log",
+ "pollster",
+ "schematic-wgpu-mesher",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
+name = "schematic-wgpu-web"
+version = "0.1.0"
+dependencies = [
+ "console_error_panic_hook",
+ "console_log",
+ "js-sys",
+ "log",
+ "schematic-wgpu-export",
+ "schematic-wgpu-litematic",
+ "schematic-wgpu-mc-assets",
+ "schematic-wgpu-mesher",
+ "schematic-wgpu-viewer",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "wgpu",
+ "winit",
 ]
 
 [[package]]
@@ -2253,21 +2290,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
-name = "viewer"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "glam",
- "log",
- "mesher",
- "pollster",
- "wasm-bindgen-futures",
- "web-sys",
- "wgpu",
- "winit",
-]
-
-[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2449,28 +2471,6 @@ dependencies = [
  "log",
  "once_cell",
  "pkg-config",
-]
-
-[[package]]
-name = "web"
-version = "0.1.0"
-dependencies = [
- "console_error_panic_hook",
- "console_log",
- "export",
- "js-sys",
- "litematic",
- "log",
- "mc-assets",
- "mesher",
- "serde",
- "serde_json",
- "viewer",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
- "wgpu",
- "winit",
 ]
 
 [[package]]

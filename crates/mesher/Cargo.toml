@@ -1,13 +1,16 @@
 [package]
-name = "mesher"
-version = "0.1.0"
-edition = "2024"
+name = "schematic-wgpu-mesher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Build textured meshes from Litematica schematics"
+
 
 [dependencies]
 glam = "0.33.10"
-litematic = { path = "../litematic" }
-mc-assets = { path = "../mc-assets" }
+litematic = { package = "schematic-wgpu-litematic", version = "0.1.0", path = "../litematic" }
+mc-assets = { package = "schematic-wgpu-mc-assets", version = "0.1.0", path = "../mc-assets" }
 thiserror = "2.0.21"
 
 [dev-dependencies]

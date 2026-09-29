@@ -43,6 +43,7 @@ fn main() {
                 // Back from FBX's bottom-up v to our top-down atlas.
                 uv: [uv.x as f32, 1.0 - uv.y as f32],
                 color: [255; 4],
+                ao: 1.0,
             });
         }
         for k in 1..face.num_indices - 1 {

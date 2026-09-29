@@ -24,6 +24,9 @@ pub struct Vertex {
     pub uv: [f32; 2],
     /// Tint multiplied with the texture, RGBA8.
     pub color: [u8; 4],
+    /// Ambient occlusion brightness from neighbouring blocks, 0..1 (1 = unoccluded).
+    /// Kept apart from `color` so renderers and exporters can choose to use it.
+    pub ao: f32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -36,8 +39,12 @@ pub struct MeshLayer {
 impl MeshLayer {
     fn push_quad(&mut self, corners: [Vertex; 4]) {
         let base = self.vertices.len() as u32;
+        // Split along the diagonal with the smoother occlusion gradient, as
+        // Minecraft does, so dark corners don't bleed across the quad.
+        let ao = corners.map(|v| v.ao);
+        let order = if ao[0] + ao[2] < ao[1] + ao[3] { [1, 2, 3, 1, 3, 0] } else { [0, 1, 2, 0, 2, 3] };
         self.vertices.extend(corners);
-        self.indices.extend([0, 1, 2, 0, 2, 3].map(|i| base + i));
+        self.indices.extend(order.map(|i| base + i));
     }
 
     pub fn is_empty(&self) -> bool {
@@ -98,13 +105,18 @@ pub struct Options {
     /// textures instead of using vertex colors. Formats and tools that
     /// ignore vertex colors then still show the right colors.
     pub bake_tint: bool,
+    /// Compute [`Vertex::ao`] from neighbouring blocks; otherwise it is always 1.
+    pub ambient_occlusion: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { placeholder_for_missing: true, bake_tint: false }
+        Self { placeholder_for_missing: true, bake_tint: false, ambient_occlusion: true }
     }
 }
+
+/// Brightness for 0..=3 unoccluded neighbours around a vertex.
+const AO_LEVELS: [f32; 4] = [0.45, 0.62, 0.8, 1.0];
 
 /// A palette entry baked into quads. Weighted variants have one quad list
 /// per choice; `parts` are always all drawn.
@@ -117,6 +129,8 @@ struct BakedState {
     /// Whether the block fills each side at all, for culling between
     /// identical transparent blocks such as glass.
     full_sides: [bool; 6],
+    /// Whether the block is a full opaque cube that casts ambient occlusion.
+    occludes: bool,
     tint: [u8; 3],
     /// Liquids hide faces touching the same liquid at any level.
     fluid: Option<&'static str>,
@@ -189,11 +203,17 @@ impl<'a> Mesher<'a> {
                             _ => (self.sprite(quad.texture.clone()), tint.unwrap_or([255; 3])),
                         };
                         let transparency = self.sprites[sprite as usize].transparency;
+                        let ao = if self.options.ambient_occlusion && quad.ambient_occlusion {
+                            vertex_ao(region, &baked, pos, quad)
+                        } else {
+                            [1.0; 4]
+                        };
                         let corners = std::array::from_fn(|i| Vertex {
                             position: (block_pos + quad.positions[i]).into(),
                             normal: quad.normal.into(),
                             uv: quad.uvs[i],
                             color: [r, g, b, 255],
+                            ao: ao[i],
                         });
                         pending.push((transparency, corners, sprite));
                     }
@@ -319,12 +339,14 @@ impl<'a> Mesher<'a> {
                 }
             }
         }
+        let fluid = LIQUIDS.into_iter().find(|&l| l == name);
         BakedState {
             parts,
             opaque_sides,
             full_sides,
+            occludes: fluid.is_none() && opaque_sides.iter().all(|&o| o),
             tint: tint::color(name, &state.properties),
-            fluid: LIQUIDS.into_iter().find(|&l| l == name),
+            fluid,
             reported,
             skip: false,
         }
@@ -365,6 +387,45 @@ fn is_hidden(region: &Region, baked: &[BakedState], pos: Vec3i, index: usize, di
     neighbour.opaque_sides[side]
         || (neighbour_index == index && neighbour.full_sides[side])
         || (neighbour.fluid.is_some() && neighbour.fluid == baked[index].fluid)
+}
+
+/// Whether the block at `pos` (region-local) is a full opaque cube.
+fn occludes(region: &Region, baked: &[BakedState], [x, y, z]: [i32; 3]) -> bool {
+    let inside = (0..region.size.x).contains(&x) && (0..region.size.y).contains(&y) && (0..region.size.z).contains(&z);
+    inside && baked[region.blocks[region.index(x, y, z)] as usize].occludes
+}
+
+/// Minecraft-style ambient occlusion for each corner of an axis-aligned quad:
+/// every corner looks at the two edge neighbours and the diagonal neighbour in
+/// the layer of blocks the face looks into. Other quads are left unoccluded.
+fn vertex_ao(region: &Region, baked: &[BakedState], pos: Vec3i, quad: &Quad) -> [f32; 4] {
+    let n = quad.normal;
+    let Some(axis) = (0..3).find(|&a| n[a].abs() > 0.999) else { return [1.0; 4] };
+    let sign = n[axis].signum() as i32;
+    let (t1, t2) = ((axis + 1) % 3, (axis + 2) % 3);
+
+    // Faces on the block's boundary look into the neighbouring layer; inset
+    // faces (slab tops, stair steps) look into the block's own layer.
+    let plane = quad.positions[0][axis];
+    let on_boundary = if sign > 0 { plane > 1.0 - 1e-4 } else { plane < 1e-4 };
+    let mut front = [pos.x, pos.y, pos.z];
+    if on_boundary {
+        front[axis] += sign;
+    }
+
+    quad.positions.map(|p| {
+        let d1 = if p[t1] > 0.5 { 1 } else { -1 };
+        let d2 = if p[t2] > 0.5 { 1 } else { -1 };
+        let offset = |a: i32, b: i32| {
+            let mut c = front;
+            c[t1] += a;
+            c[t2] += b;
+            occludes(region, baked, c)
+        };
+        let (side1, side2, corner) = (offset(d1, 0), offset(0, d2), offset(d1, d2));
+        let level = if side1 && side2 { 0 } else { 3 - (side1 as usize + side2 as usize + corner as usize) };
+        AO_LEVELS[level]
+    })
 }
 
 fn placeholder_cube() -> Vec<Quad> {
@@ -553,6 +614,30 @@ mod tests {
         let (mesh, _) = mesh(&lit);
         // Water-water contact is hidden, water-lava is not: 6*3 - 2 = 16.
         assert_eq!(mesh.triangle_count() / 2, 16);
+    }
+
+    #[test]
+    fn ambient_occlusion_darkens_corners_next_to_a_wall() {
+        // Two floor blocks along X, and a wall block on top of the second one.
+        let palette = vec![state("air", &[]), state("stone", &[])];
+        let lit = schematic(Vec3i { x: 2, y: 2, z: 1 }, palette, vec![1, 1, 0, 1]);
+        let (mesh, _) = mesh(&lit);
+        let top_of_first: Vec<&Vertex> = mesh
+            .opaque
+            .vertices
+            .iter()
+            .filter(|v| v.normal == [0.0, 1.0, 0.0] && v.position[1] == 1.0 && v.position[0] <= 11.0)
+            .collect();
+        assert_eq!(top_of_first.len(), 4);
+        for v in top_of_first {
+            let expected = if v.position[0] == 11.0 { AO_LEVELS[2] } else { 1.0 };
+            assert_eq!(v.ao, expected, "{v:?}");
+        }
+
+        let mut assets = assets();
+        let options = Options { ambient_occlusion: false, ..Default::default() };
+        let (mesh, _) = Mesher::new(&mut assets, options).build(&lit);
+        assert!(mesh.opaque.vertices.iter().all(|v| v.ao == 1.0));
     }
 
     #[test]

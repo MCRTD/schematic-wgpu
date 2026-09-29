@@ -71,6 +71,12 @@ enum Command {
         /// Zoom factor; 2 is twice as close as the default framing
         #[arg(long, default_value_t = 1.0)]
         zoom: f32,
+        /// Don't cast sun shadows
+        #[arg(long)]
+        no_shadows: bool,
+        /// Don't draw the ground under the build
+        #[arg(long)]
+        no_ground: bool,
     },
 }
 
@@ -128,6 +134,7 @@ fn main() -> anyhow::Result<()> {
             let options = mesher::Options {
                 placeholder_for_missing: !no_placeholders,
                 bake_tint: format.wants_baked_tint(),
+                ..Default::default()
             };
             let (mesh, report) = mesher::Mesher::new(&mut assets, options).build(&lit);
             print_report(&report);
@@ -147,8 +154,9 @@ fn main() -> anyhow::Result<()> {
             let name = if lit.metadata.name.is_empty() { "schematic" } else { &lit.metadata.name };
             viewer::app::run(mesh, &format!("{name} - schematic viewer"))?;
         }
-        Command::Render { litematic, packs, output, width, height, yaw, pitch, zoom } => {
-            render(litematic, packs, output, (width, height), (yaw, pitch, zoom))?;
+        Command::Render { litematic, packs, output, width, height, yaw, pitch, zoom, no_shadows, no_ground } => {
+            let lighting = viewer::Lighting { shadows: !no_shadows, ground: !no_ground, ..Default::default() };
+            render(litematic, packs, output, (width, height), (yaw, pitch, zoom), &lighting)?;
         }
     }
     Ok(())
@@ -160,6 +168,7 @@ fn render(
     output: Option<PathBuf>,
     (width, height): (u32, u32),
     (yaw, pitch, zoom): (f32, f32, f32),
+    lighting: &viewer::Lighting,
 ) -> anyhow::Result<()> {
     let lit = open(&litematic)?;
     let mut assets = load_packs(&packs)?;
@@ -174,7 +183,7 @@ fn render(
     camera.frame(glam::Vec3::from(mesh.bounds[0]), glam::Vec3::from(mesh.bounds[1]));
     camera.distance /= zoom;
 
-    let pixels = pollster::block_on(viewer::headless::render(&mesh, &camera, width, height))?;
+    let pixels = pollster::block_on(viewer::headless::render_with_lighting(&mesh, &camera, width, height, lighting))?;
     let output = output.unwrap_or_else(|| litematic.with_extension("png"));
     image::RgbaImage::from_raw(width, height, pixels)
         .context("rendered image has the wrong size")?
