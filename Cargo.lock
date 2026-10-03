@@ -1787,7 +1787,7 @@ dependencies = [
 
 [[package]]
 name = "schematic-wgpu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1804,7 +1804,7 @@ dependencies = [
 
 [[package]]
 name = "schematic-wgpu-export"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "glam",
@@ -1819,7 +1819,7 @@ dependencies = [
 
 [[package]]
 name = "schematic-wgpu-litematic"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fastnbt",
  "flate2",
@@ -1829,7 +1829,7 @@ dependencies = [
 
 [[package]]
 name = "schematic-wgpu-mc-assets"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "image",
@@ -1841,7 +1841,7 @@ dependencies = [
 
 [[package]]
 name = "schematic-wgpu-mesher"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "glam",
  "image",
@@ -1852,7 +1852,7 @@ dependencies = [
 
 [[package]]
 name = "schematic-wgpu-viewer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "glam",
@@ -1867,7 +1867,7 @@ dependencies = [
 
 [[package]]
 name = "schematic-wgpu-web"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "console_error_panic_hook",
  "console_log",

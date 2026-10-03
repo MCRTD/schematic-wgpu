@@ -3,6 +3,8 @@
 //! A `.litematic` file is a gzip-compressed NBT compound. Each region stores a
 //! block-state palette plus a tightly packed `long[]` of palette indices.
 
+mod preview;
+
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
@@ -20,6 +22,8 @@ pub enum Error {
     PaletteIndex { region: String, index: u32, len: usize },
     #[error("region `{region}`: block state array too short ({got} longs, need {need})")]
     ShortBlockStates { region: String, got: usize, need: usize },
+    #[error("invalid preview: {0}")]
+    Preview(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -51,7 +55,7 @@ impl BlockState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Metadata {
     #[serde(default)]
@@ -96,7 +100,7 @@ struct RawLitematic {
 
 /// A decoded region. Blocks are stored as palette indices in
 /// `(y * size.z + z) * size.x + x` order, where `size` is the absolute size.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Region {
     pub name: String,
     /// Minimum corner of the region, relative to the schematic origin.
@@ -173,7 +177,7 @@ impl Region {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Litematic {
     pub data_version: i32,
     pub version: i32,

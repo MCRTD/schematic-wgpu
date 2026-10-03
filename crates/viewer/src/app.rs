@@ -20,6 +20,9 @@ pub enum UserEvent {
     GpuReady(Box<Gpu>),
     /// Show a different model.
     SetMesh(Box<Mesh>),
+    /// Stop the event loop and release the window and GPU. On the web this
+    /// lets a new viewer be spawned afterwards.
+    Exit,
 }
 
 pub struct Gpu {
@@ -160,6 +163,16 @@ pub struct Viewer {
     camera: OrbitCamera,
     drag: Drag,
     modifiers: ModifiersState,
+    /// Called once the viewer has been torn down.
+    on_exit: Option<Box<dyn FnOnce()>>,
+}
+
+impl Drop for Viewer {
+    fn drop(&mut self) {
+        if let Some(on_exit) = self.on_exit.take() {
+            on_exit();
+        }
+    }
 }
 
 impl Viewer {
@@ -212,7 +225,7 @@ impl ApplicationHandler<UserEvent> for Viewer {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::GpuReady(gpu) => {
                 self.gpu = Some(*gpu);
@@ -221,6 +234,7 @@ impl ApplicationHandler<UserEvent> for Viewer {
                 }
             }
             UserEvent::SetMesh(mesh) => self.show(*mesh),
+            UserEvent::Exit => event_loop.exit(),
         }
     }
 
@@ -296,6 +310,7 @@ impl Viewer {
             camera: OrbitCamera::default(),
             drag: Drag::default(),
             modifiers: ModifiersState::empty(),
+            on_exit: None,
         }
     }
 }
@@ -313,12 +328,21 @@ pub fn run(mesh: Mesh, title: &str) -> Result<(), winit::error::EventLoopError> 
 
 /// Start the viewer on a canvas. The event loop runs in the background;
 /// send [`UserEvent::SetMesh`] through the returned proxy to show a model.
+///
+/// Only one viewer can run at a time. Send [`UserEvent::Exit`] to stop it;
+/// `on_exit` runs while winit tears the loop down, and once the current
+/// JavaScript task has finished a new viewer can be spawned.
 #[cfg(target_arch = "wasm32")]
-pub fn spawn(canvas: web_sys::HtmlCanvasElement) -> Result<EventLoopProxy<UserEvent>, winit::error::EventLoopError> {
+pub fn spawn(
+    canvas: web_sys::HtmlCanvasElement,
+    on_exit: impl FnOnce() + 'static,
+) -> Result<EventLoopProxy<UserEvent>, winit::error::EventLoopError> {
     use winit::platform::web::EventLoopExtWebSys;
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
-    event_loop.spawn_app(Viewer::new(proxy.clone(), "schematic viewer", canvas));
+    let mut viewer = Viewer::new(proxy.clone(), "schematic viewer", canvas);
+    viewer.on_exit = Some(Box::new(on_exit));
+    event_loop.spawn_app(viewer);
     Ok(proxy)
 }

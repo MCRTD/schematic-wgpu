@@ -5,7 +5,9 @@
 //! Build with `scripts/build-web.sh`; this crate is empty on other targets.
 #![cfg(target_arch = "wasm32")]
 
+use std::cell::RefCell;
 use std::io::Cursor;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use litematic::Litematic;
@@ -180,10 +182,21 @@ pub async fn load_vanilla(version: String, progress: js_sys::Function) -> Result
     Ok(VanillaAssets { version, source: Arc::new(remote_zip::into_source(files)), downloaded })
 }
 
+/// Whether the viewer's event loop has been torn down, and who is waiting for it.
+#[derive(Default)]
+struct Shutdown {
+    done: bool,
+    waiting: Vec<js_sys::Function>,
+}
+
 /// The page's state: which assets are loaded and which schematic is shown.
+///
+/// Only one `App` can run at a time. Await [`App::destroy`] before creating
+/// the next one, e.g. when a component that shows the viewer unmounts.
 #[wasm_bindgen]
 pub struct App {
     viewer: EventLoopProxy<UserEvent>,
+    shutdown: Rc<RefCell<Shutdown>>,
     vanilla: Option<Arc<MemorySource>>,
     /// User resource packs, highest priority first.
     packs: Vec<Arc<ZipSource<Cursor<Vec<u8>>>>>,
@@ -195,8 +208,48 @@ pub struct App {
 impl App {
     #[wasm_bindgen(constructor)]
     pub fn new(canvas: web_sys::HtmlCanvasElement) -> Result<App, JsError> {
-        let viewer = viewer::app::spawn(canvas).map_err(|e| JsError::new(&e.to_string()))?;
-        Ok(App { viewer, vanilla: None, packs: Vec::new(), schematic: None, mesh: None })
+        let shutdown = Rc::new(RefCell::new(Shutdown::default()));
+        let on_exit = {
+            let shutdown = shutdown.clone();
+            move || {
+                let waiting = {
+                    let mut shutdown = shutdown.borrow_mut();
+                    shutdown.done = true;
+                    std::mem::take(&mut shutdown.waiting)
+                };
+                for resolve in waiting {
+                    let _ = resolve.call0(&JsValue::NULL);
+                }
+            }
+        };
+        let viewer = viewer::app::spawn(canvas, on_exit).map_err(|e| match e {
+            winit::error::EventLoopError::RecreationAttempt => {
+                JsError::new("another viewer is still running; await its destroy() first")
+            }
+            e => JsError::new(&e.to_string()),
+        })?;
+        Ok(App { viewer, shutdown, vanilla: None, packs: Vec::new(), schematic: None, mesh: None })
+    }
+
+    /// Stop the viewer and release its canvas and GPU resources. The promise
+    /// resolves once a new `App` can be created. Calling it again is harmless;
+    /// `free()` the object afterwards as usual.
+    pub fn destroy(&mut self) -> js_sys::Promise {
+        self.schematic = None;
+        self.mesh = None;
+        let shutdown = self.shutdown.clone();
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            let mut shutdown = shutdown.borrow_mut();
+            if shutdown.done {
+                let _ = resolve.call0(&JsValue::NULL);
+            } else {
+                shutdown.waiting.push(resolve);
+            }
+        });
+        if !self.shutdown.borrow().done {
+            let _ = self.viewer.send_event(UserEvent::Exit);
+        }
+        promise
     }
 
     /// Use these Mojang assets as the base pack. Returns a mesh report if a
@@ -220,6 +273,13 @@ impl App {
     /// Show a `.litematic` file. Returns a report once assets are available.
     pub fn load_schematic(&mut self, bytes: &[u8]) -> Result<Option<String>, JsError> {
         self.schematic = Some(Litematic::from_gzip_bytes(bytes)?);
+        self.rebuild()
+    }
+
+    /// Show an already decoded schematic, as made by `Litematic::to_preview`
+    /// (e.g. served by a blueprint site). Returns a report once assets are available.
+    pub fn load_preview(&mut self, bytes: &[u8]) -> Result<Option<String>, JsError> {
+        self.schematic = Some(Litematic::from_preview(bytes)?);
         self.rebuild()
     }
 
@@ -288,5 +348,14 @@ impl App {
         let _ = self.viewer.send_event(UserEvent::SetMesh(Box::new(mesh.clone())));
         self.mesh = Some(mesh);
         Ok(Some(summary))
+    }
+}
+
+/// Freeing the object without `destroy()` still stops the viewer.
+impl Drop for App {
+    fn drop(&mut self) {
+        if !self.shutdown.borrow().done {
+            let _ = self.viewer.send_event(UserEvent::Exit);
+        }
     }
 }
