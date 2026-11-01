@@ -37,11 +37,52 @@ pub struct Atlas {
     /// How many mip levels (including the full-size one) can be generated
     /// without sprites bleeding into each other.
     pub mip_levels: u32,
+    /// LabPBR maps of the sprites, if any sprite has one.
+    pub pbr: Option<PbrMaps>,
+}
+
+/// LabPBR maps laid out like the atlas: same size, same sprite positions.
+/// Both are data, not colors (no sRGB).
+#[derive(Debug, Clone)]
+pub struct PbrMaps {
+    /// From `_n` textures: normal X and Y, material ambient occlusion,
+    /// height. Flat where a sprite has none.
+    pub normal: Vec<u8>,
+    /// From `_s` textures: smoothness, F0 or metal, porosity, emission.
+    /// Zero (rough, not reflective) where a sprite has none.
+    pub specular: Vec<u8>,
+}
+
+/// The `_n` and `_s` maps of one sprite.
+pub type SpriteMaps = [Option<Arc<Texture>>; 2];
+
+/// A flat normal without occlusion, and no specular response.
+const DEFAULT_MAPS: [[u8; 4]; 2] = [[128, 128, 255, 255], [0, 0, 0, 0]];
+
+/// Copy `image` into the padded cell at `(px, py)` that holds `sprite`,
+/// scaling it to the sprite's size and extruding its edges into the padding.
+fn blit(rgba: &mut [u8], width: u32, (px, py): (u32, u32), sprite: &Texture, image: &Texture) {
+    let p = padding(sprite);
+    for y in 0..sprite.height + 2 * p {
+        for x in 0..sprite.width + 2 * p {
+            let sx = x.saturating_sub(p).min(sprite.width - 1) * image.width / sprite.width;
+            let sy = y.saturating_sub(p).min(sprite.height - 1) * image.height / sprite.height;
+            let src = ((sy * image.width + sx) * 4) as usize;
+            let dst = (((py + y) * width + px + x) * 4) as usize;
+            rgba[dst..dst + 4].copy_from_slice(&image.rgba[src..src + 4]);
+        }
+    }
 }
 
 impl Atlas {
     /// Shelf-pack sprites, tallest first, into a power-of-two sized image.
     pub fn pack(sprites: &[Arc<Texture>]) -> Atlas {
+        Self::pack_with_pbr(sprites, &[])
+    }
+
+    /// Like [`Atlas::pack`], also laying out each sprite's LabPBR maps,
+    /// given in the same order (missing entries count as none).
+    pub fn pack_with_pbr(sprites: &[Arc<Texture>], maps: &[SpriteMaps]) -> Atlas {
         let padded = |t: &Texture| (t.width + 2 * padding(t), t.height + 2 * padding(t));
         let area: u32 = sprites.iter().map(|t| padded(t).0 * padded(t).1).sum();
         let widest = sprites.iter().map(|t| padded(t).0).max().unwrap_or(1);
@@ -76,18 +117,9 @@ impl Atlas {
         let rects = sprites
             .iter()
             .zip(&positions)
-            .map(|(t, &(px, py))| {
-                let (w, h) = padded(t);
-                for y in 0..h {
-                    for x in 0..w {
-                        // Clamp into the sprite to extrude its edges into the padding.
-                        let sx = x.saturating_sub(padding(t)).min(t.width - 1);
-                        let sy = y.saturating_sub(padding(t)).min(t.height - 1);
-                        let src = ((sy * t.width + sx) * 4) as usize;
-                        let dst = (((py + y) * width + px + x) * 4) as usize;
-                        rgba[dst..dst + 4].copy_from_slice(&t.rgba[src..src + 4]);
-                    }
-                }
+            .map(|(t, &position)| {
+                blit(&mut rgba, width, position, t, t);
+                let (px, py) = position;
                 let p = padding(t);
                 Rect {
                     min: [(px + p) as f32 / width as f32, (py + p) as f32 / height as f32],
@@ -109,7 +141,20 @@ impl Atlas {
             .min(width.min(height).trailing_zeros())
             + 1;
 
-        Atlas { width, height, rgba, rects, mip_levels }
+        let pbr = maps.iter().any(|m| m.iter().any(Option::is_some)).then(|| {
+            let [normal, specular] = [0, 1].map(|k| {
+                let mut layer = DEFAULT_MAPS[k].repeat((width * height) as usize);
+                for (i, (t, &position)) in sprites.iter().zip(&positions).enumerate() {
+                    if let Some(image) = maps.get(i).and_then(|m| m[k].as_ref()) {
+                        blit(&mut layer, width, position, t, image);
+                    }
+                }
+                layer
+            });
+            PbrMaps { normal, specular }
+        });
+
+        Atlas { width, height, rgba, rects, mip_levels, pbr }
     }
 
     /// The atlas with every texel repeated `factor` times in each direction.
@@ -132,7 +177,39 @@ impl Atlas {
             rgba,
             rects: self.rects.clone(),
             mip_levels: self.mip_levels + factor.ilog2(),
+            // Only used by the viewer, which doesn't upscale.
+            pbr: None,
         }
+    }
+
+    /// Downsampled copies of a [`PbrMaps`] layer for levels `1..mip_levels`:
+    /// plain averages, as the channels are data rather than colors.
+    pub fn data_mip_chain(&self, layer: &[u8]) -> Vec<(u32, u32, Vec<u8>)> {
+        let mut levels: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+        let (mut w, mut h) = (self.width, self.height);
+        for _ in 1..self.mip_levels {
+            let prev = levels.last().map_or(layer, |(_, _, l)| l);
+            let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
+            let mut next = vec![0u8; (nw * nh * 4) as usize];
+            for y in 0..nh {
+                for x in 0..nw {
+                    let mut sum = [0u32; 4];
+                    for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                        let i = (((y * 2 + dy).min(h - 1) * w + (x * 2 + dx).min(w - 1)) * 4) as usize;
+                        for k in 0..4 {
+                            sum[k] += prev[i + k] as u32;
+                        }
+                    }
+                    let o = ((y * nw + x) * 4) as usize;
+                    for k in 0..4 {
+                        next[o + k] = ((sum[k] + 2) / 4) as u8;
+                    }
+                }
+            }
+            levels.push((nw, nh, next));
+            (w, h) = (nw, nh);
+        }
+        levels
     }
 
     /// Downsampled copies of the atlas for levels `1..mip_levels`, each half
@@ -234,6 +311,31 @@ mod tests {
                 assert_eq!(&rgba[i..i + 4], &color, "level {w}x{h}");
             }
         }
+    }
+
+    #[test]
+    fn pbr_maps_line_up_with_their_sprites() {
+        let sprites = [solid(16, [255, 0, 0, 255]), solid(16, [0, 0, 255, 255])];
+        assert!(Atlas::pack(&sprites).pbr.is_none());
+        // The first sprite has a 32px normal map (scaled to fit), the second none.
+        let maps = [[Some(solid(32, [10, 20, 30, 40])), None], [None, None]];
+        let atlas = Atlas::pack_with_pbr(&sprites, &maps);
+        let pbr = atlas.pbr.as_ref().unwrap();
+        let at = |layer: &[u8], uv: [f32; 2]| {
+            let (x, y) = ((uv[0] * atlas.width as f32) as u32, (uv[1] * atlas.height as f32) as u32);
+            layer[((y * atlas.width + x) * 4) as usize..][..4].to_vec()
+        };
+        for uv in [[0.5, 0.5], [0.001, 0.999]] {
+            assert_eq!(at(&pbr.normal, atlas.rects[0].map(uv)), [10, 20, 30, 40]);
+            assert_eq!(at(&pbr.normal, atlas.rects[1].map(uv)), DEFAULT_MAPS[0]);
+            assert_eq!(at(&pbr.specular, atlas.rects[0].map(uv)), DEFAULT_MAPS[1]);
+        }
+        let chain = atlas.data_mip_chain(&pbr.normal);
+        assert_eq!(chain.len() as u32, atlas.mip_levels - 1);
+        let (w, h, last) = chain.last().unwrap();
+        let [u, v] = atlas.rects[0].map([0.5, 0.5]);
+        let i = (((v * *h as f32) as u32 * w + (u * *w as f32) as u32) * 4) as usize;
+        assert_eq!(&last[i..i + 4], &[10, 20, 30, 40]);
     }
 
     #[test]

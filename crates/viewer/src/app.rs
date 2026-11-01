@@ -1,7 +1,7 @@
 //! Interactive window: left drag orbits, right/middle drag (or shift + left)
 //! pans, scroll zooms, `R` re-frames the model. Page Down / Page Up (or `[`
 //! and `]`) step through the build layer by layer, top down; `Esc` shows
-//! every layer again. On the web the page drives the layer view instead,
+//! every layer again. `T` cycles the time of day. On the web the page drives the layer view instead,
 //! through [`UserEvent::SetSlice`], so it can keep its own controls in sync.
 
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::{OrbitCamera, Renderer};
+use crate::{OrbitCamera, Renderer, TimeOfDay};
 
 /// Messages delivered to the event loop from outside it.
 pub enum UserEvent {
@@ -35,6 +35,8 @@ pub enum UserEvent {
     /// Hide blocks above this world Y; `None` shows them all.
     /// See [`Renderer::set_slice`].
     SetSlice(Option<i32>),
+    /// Light the scene as at this time of day; see [`crate::Lighting::set_time`].
+    SetTime(TimeOfDay),
     /// Stop the event loop and release the window and GPU. On the web this
     /// lets a new viewer be spawned afterwards.
     Exit,
@@ -178,6 +180,8 @@ pub struct Viewer {
     camera: OrbitCamera,
     drag: Drag,
     modifiers: ModifiersState,
+    #[cfg(not(target_arch = "wasm32"))]
+    time: TimeOfDay,
     /// Called once the viewer has been torn down.
     on_exit: Option<Box<dyn FnOnce()>>,
 }
@@ -219,6 +223,12 @@ impl Viewer {
             }
             UserEvent::SetSlice(top) => {
                 gpu.renderer.set_slice(device, queue, top);
+                None
+            }
+            UserEvent::SetTime(time) => {
+                let mut lighting = gpu.renderer.lighting().clone();
+                lighting.set_time(time);
+                gpu.renderer.set_lighting(device, queue, lighting);
                 None
             }
             UserEvent::GpuReady(_) | UserEvent::Exit => unreachable!("not a render event"),
@@ -364,6 +374,10 @@ impl ApplicationHandler<UserEvent> for Viewer {
                     Key::Named(NamedKey::PageDown) | Key::Character("[") => self.step_slice(Some(-1)),
                     Key::Named(NamedKey::PageUp) | Key::Character("]") => self.step_slice(Some(1)),
                     Key::Named(NamedKey::Escape) => self.step_slice(None),
+                    Key::Character("t" | "T") => {
+                        self.time = TimeOfDay::ALL[(self.time as usize + 1) % TimeOfDay::ALL.len()];
+                        self.render_event(UserEvent::SetTime(self.time));
+                    }
                     _ => {}
                 }
             }
@@ -385,6 +399,8 @@ impl Viewer {
             camera: OrbitCamera::default(),
             drag: Drag::default(),
             modifiers: ModifiersState::empty(),
+            #[cfg(not(target_arch = "wasm32"))]
+            time: TimeOfDay::Day,
             on_exit: None,
         }
     }

@@ -39,7 +39,13 @@
     #status.error { color: var(--error); }
     #report { margin-top: 8px; font-size: 12px; white-space: pre-wrap; }
     #report .warn { color: var(--warn); }
-    #packs { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    #packs { list-style: none; margin: 6px 0 0; padding: 0; font-size: 12px; }
+    #packs li { display: flex; align-items: center; gap: 4px; padding: 3px 4px 3px 8px; margin-top: 4px;
+      border: 1px solid var(--border); border-radius: 6px; background: #1b1f28; cursor: grab; }
+    #packs li.base { cursor: default; color: var(--muted); background: none; border-style: dashed; }
+    #packs li.over { border-color: var(--accent); }
+    #packs .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #packs button { width: auto; padding: 1px 7px; font-size: 12px; }
     #layer { width: 100%; accent-color: var(--accent); }
     #layer-label { float: right; color: var(--text); font-variant-numeric: tabular-nums; }
     .hint, .legal { font-size: 11px; color: var(--muted); margin-top: 12px; }
@@ -60,13 +66,20 @@
     <label for="version">Minecraft version (block models &amp; textures)</label>
     <select id="version" disabled><option>Loading versions…</option></select>
 
-    <label>Resource packs (optional, stacked on top)</label>
+    <label>Resource packs &amp; mods (optional; the top one wins)</label>
     <div class="row">
-      <button id="add-pack">Add .zip…</button>
+      <button id="add-pack">Add .zip / .jar…</button>
       <button id="clear-packs" disabled>Clear</button>
     </div>
     <input id="pack-file" type="file" accept=".zip,.jar" multiple hidden>
-    <div id="packs"></div>
+    <ol id="packs"></ol>
+
+    <label for="time">Time of day</label>
+    <select id="time">
+      <option value="day">Day</option>
+      <option value="sunset">Sunset</option>
+      <option value="night">Night</option>
+    </select>
 
     <label for="layer">Layers <span id="layer-label"></span></label>
     <input id="layer" type="range" min="1" max="1" value="1" disabled>

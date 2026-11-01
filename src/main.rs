@@ -25,14 +25,14 @@ enum Command {
     /// Build the 3D mesh and report statistics and unsupported blocks
     Mesh {
         litematic: PathBuf,
-        /// Resource packs (folder, .zip or client .jar), highest priority first
+        /// Resource packs or mods (folder, .zip, client .jar or mod .jar), highest priority first
         #[arg(short, long = "pack", required = true)]
         packs: Vec<PathBuf>,
     },
     /// Export a .litematic file as .glb, .gltf, .obj or .fbx
     Export {
         litematic: PathBuf,
-        /// Resource packs (folder, .zip or client .jar), highest priority first
+        /// Resource packs or mods (folder, .zip, client .jar or mod .jar), highest priority first
         #[arg(short, long = "pack", required = true)]
         packs: Vec<PathBuf>,
         /// Output file; the format follows the extension (defaults to <input>.glb)
@@ -45,14 +45,14 @@ enum Command {
     /// Open an interactive 3D viewer window
     View {
         litematic: PathBuf,
-        /// Resource packs (folder, .zip or client .jar), highest priority first
+        /// Resource packs or mods (folder, .zip, client .jar or mod .jar), highest priority first
         #[arg(short, long = "pack", required = true)]
         packs: Vec<PathBuf>,
     },
     /// Render a .litematic file to a PNG image on the GPU
     Render {
         litematic: PathBuf,
-        /// Resource packs (folder, .zip or client .jar), highest priority first
+        /// Resource packs or mods (folder, .zip, client .jar or mod .jar), highest priority first
         #[arg(short, long = "pack", required = true)]
         packs: Vec<PathBuf>,
         /// Output image (defaults to <input>.png)
@@ -77,6 +77,12 @@ enum Command {
         /// Don't draw the ground under the build
         #[arg(long)]
         no_ground: bool,
+        /// Ignore the LabPBR normal and specular maps of resource packs
+        #[arg(long)]
+        no_pbr: bool,
+        /// Time of day: day, sunset or night (light sources show at night)
+        #[arg(long, default_value = "day")]
+        time: viewer::TimeOfDay,
         /// Only show blocks up to this layer, counted from 1 at the bottom
         #[arg(long)]
         layer: Option<i32>,
@@ -152,14 +158,15 @@ fn main() -> anyhow::Result<()> {
         Command::View { litematic, packs } => {
             let lit = open(&litematic)?;
             let mut assets = load_packs(&packs)?;
-            let options = mesher::Options { slice_caps: true, ..Default::default() };
+            let options = mesher::Options { slice_caps: true, pbr_maps: true, ..Default::default() };
             let (mesh, report) = mesher::Mesher::new(&mut assets, options).build(&lit);
             print_report(&report);
             let name = if lit.metadata.name.is_empty() { "schematic" } else { &lit.metadata.name };
             viewer::app::run(mesh, &format!("{name} - schematic viewer"))?;
         }
-        Command::Render { litematic, packs, output, width, height, yaw, pitch, zoom, no_shadows, no_ground, layer } => {
-            let lighting = viewer::Lighting { shadows: !no_shadows, ground: !no_ground, ..Default::default() };
+        Command::Render { litematic, packs, output, width, height, yaw, pitch, zoom, no_shadows, no_ground, no_pbr, time, layer } => {
+            let lighting =
+                viewer::Lighting { shadows: !no_shadows, ground: !no_ground, pbr: !no_pbr, ..viewer::Lighting::at(time) };
             render(litematic, packs, output, (width, height), (yaw, pitch, zoom), &lighting, layer)?;
         }
     }
@@ -177,7 +184,7 @@ fn render(
 ) -> anyhow::Result<()> {
     let lit = open(&litematic)?;
     let mut assets = load_packs(&packs)?;
-    let options = mesher::Options { slice_caps: layer.is_some(), ..Default::default() };
+    let options = mesher::Options { slice_caps: layer.is_some(), pbr_maps: lighting.pbr, ..Default::default() };
     let (mesh, report) = mesher::Mesher::new(&mut assets, options).build(&lit);
     print_report(&report);
 

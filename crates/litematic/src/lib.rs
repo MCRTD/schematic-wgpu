@@ -10,6 +10,8 @@ use std::io::Read;
 use std::path::Path;
 
 use flate2::read::GzDecoder;
+/// NBT data, as stored for block entities.
+pub use fastnbt::Value as Nbt;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
@@ -87,6 +89,8 @@ struct RawRegion {
     size: Vec3i,
     block_state_palette: Vec<BlockState>,
     block_states: fastnbt::LongArray,
+    #[serde(default)]
+    tile_entities: Vec<Nbt>,
 }
 
 #[derive(Deserialize)]
@@ -100,9 +104,18 @@ struct RawLitematic {
     regions: BTreeMap<String, RawRegion>,
 }
 
+/// Extra data of a block such as a chest, banner or sign, as saved by the game.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BlockEntity {
+    /// Local position in the region, like the coordinates of [`Region::get`].
+    pub pos: Vec3i,
+    /// Everything else the game saved, e.g. a banner's `patterns`.
+    pub nbt: Nbt,
+}
+
 /// A decoded region. Blocks are stored as palette indices in
 /// `(y * size.z + z) * size.x + x` order, where `size` is the absolute size.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Region {
     pub name: String,
     /// Minimum corner of the region, relative to the schematic origin.
@@ -111,6 +124,7 @@ pub struct Region {
     pub size: Vec3i,
     pub palette: Vec<BlockState>,
     pub blocks: Vec<u32>,
+    pub block_entities: Vec<BlockEntity>,
 }
 
 impl Region {
@@ -155,7 +169,22 @@ impl Region {
             });
         }
 
-        Ok(Region { name, origin, size, palette: raw.block_state_palette, blocks })
+        // Litematica stores block entities with their local x, y, z.
+        let block_entities = raw
+            .tile_entities
+            .into_iter()
+            .filter_map(|nbt| {
+                let Nbt::Compound(c) = &nbt else { return None };
+                let int = |k: &str| match c.get(k) {
+                    Some(Nbt::Int(v)) => Some(*v),
+                    _ => None,
+                };
+                let pos = Vec3i { x: int("x")?, y: int("y")?, z: int("z")? };
+                Some(BlockEntity { pos, nbt })
+            })
+            .collect();
+
+        Ok(Region { name, origin, size, palette: raw.block_state_palette, blocks, block_entities })
     }
 
     pub fn index(&self, x: i32, y: i32, z: i32) -> usize {
@@ -185,7 +214,7 @@ impl Region {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Litematic {
     pub data_version: i32,
     pub version: i32,
@@ -293,6 +322,7 @@ mod tests {
         size: Vec3i,
         block_state_palette: Vec<BlockState>,
         block_states: fastnbt::LongArray,
+        tile_entities: Vec<Nbt>,
     }
 
     #[derive(Serialize)]
@@ -320,6 +350,15 @@ mod tests {
         ];
         let size = Vec3i { x: 3, y: 2, z: 2 };
         let values: Vec<u32> = (0..12).map(|i| i % 3).collect();
+        let banner = Nbt::Compound(
+            [
+                ("x".into(), Nbt::Int(1)),
+                ("y".into(), Nbt::Int(0)),
+                ("z".into(), Nbt::Int(1)),
+                ("id".into(), Nbt::String("minecraft:banner".into())),
+            ]
+            .into(),
+        );
         let file = TestFile {
             minecraft_data_version: 3465,
             version: 6,
@@ -341,6 +380,7 @@ mod tests {
                     size: Vec3i { x: -3, y: 2, z: 2 },
                     block_state_palette: palette.clone(),
                     block_states: fastnbt::LongArray::new(pack(&values, 2)),
+                    tile_entities: vec![banner.clone(), Nbt::Compound([("id".into(), Nbt::String("no position".into()))].into())],
                 },
             )]),
         };
@@ -353,6 +393,7 @@ mod tests {
         assert_eq!(region.size, size);
         assert_eq!(region.origin, Vec3i { x: 3, y: 0, z: 0 });
         assert_eq!(region.blocks, values);
+        assert_eq!(region.block_entities, [BlockEntity { pos: Vec3i { x: 1, y: 0, z: 1 }, nbt: banner }]);
         assert_eq!(region.get(2, 0, 0), Some(&palette[2]));
         assert_eq!(region.get(0, 1, 0), Some(&palette[0]));
         assert_eq!(region.get(3, 0, 0), None);
@@ -367,6 +408,7 @@ mod tests {
             size: Vec3i { x: 2, y: 1, z: 1 },
             block_state_palette: vec![state("minecraft:air", &[])],
             block_states: fastnbt::LongArray::new(pack(&[0, 3], 2)),
+            tile_entities: Vec::new(),
         };
         assert!(matches!(
             Region::decode("r".into(), region),

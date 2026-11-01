@@ -15,11 +15,51 @@ pub const SAMPLE_COUNT: u32 = 4;
 const SHADOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const CLEAR: wgpu::Color = wgpu::Color { r: 0.009, g: 0.011, b: 0.015, a: 1.0 };
 
+/// Times of day with a [`Lighting`] preset each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeOfDay {
+    Day,
+    Sunset,
+    /// Moonlight, with light sources standing out.
+    Night,
+}
+
+impl TimeOfDay {
+    pub const ALL: [TimeOfDay; 3] = [TimeOfDay::Day, TimeOfDay::Sunset, TimeOfDay::Night];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TimeOfDay::Day => "day",
+            TimeOfDay::Sunset => "sunset",
+            TimeOfDay::Night => "night",
+        }
+    }
+}
+
+impl std::str::FromStr for TimeOfDay {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        Self::ALL
+            .into_iter()
+            .find(|t| t.name().eq_ignore_ascii_case(s))
+            .ok_or_else(|| format!("unknown time of day `{s}` (use day, sunset or night)"))
+    }
+}
+
 /// How the scene is lit and what surrounds it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Lighting {
-    /// Direction towards the sun, +Y up; normalised when used.
+    /// Direction towards the sun (or moon), +Y up; normalised when used.
     pub sun_direction: [f32; 3],
+    /// Color of direct sun- or moonlight, linear, 1 = full brightness.
+    pub sunlight: [f32; 3],
+    /// Color of the sky's light in shadow, linear.
+    pub skylight: [f32; 3],
+    /// Color of light from torches and other light sources at full
+    /// strength ([`mesher::Vertex::block_light`] 15), linear. It adds to
+    /// the other light, so it shows mostly at night.
+    pub block_light: [f32; 3],
     /// Cast shadows from the sun.
     pub shadows: bool,
     /// Width and height of the shadow map in texels.
@@ -33,12 +73,19 @@ pub struct Lighting {
     /// Background gradient, sRGB.
     pub sky_top: [f32; 3],
     pub sky_bottom: [f32; 3],
+    /// Use the LabPBR normal and specular maps of resource packs, when the
+    /// mesh has them (see [`mesher::Options::pbr_maps`]).
+    pub pbr: bool,
 }
 
 impl Default for Lighting {
+    /// Daytime.
     fn default() -> Self {
         Self {
             sun_direction: [-0.32, 1.0, 0.65],
+            sunlight: [1.0, 1.0, 1.0],
+            skylight: [0.46, 0.52, 0.64],
+            block_light: [1.0, 0.82, 0.6],
             shadows: true,
             shadow_map_size: 2048,
             shadow_strength: 1.0,
@@ -46,7 +93,26 @@ impl Default for Lighting {
             ground: true,
             sky_top: [0.47, 0.65, 0.88],
             sky_bottom: [0.86, 0.9, 0.95],
+            pbr: true,
         }
+    }
+}
+
+impl Lighting {
+    pub fn at(time: TimeOfDay) -> Self {
+        let mut lighting = Self::default();
+        lighting.set_time(time);
+        lighting
+    }
+
+    /// Change the sun, sky and light colors to `time`'s, keeping the rest.
+    pub fn set_time(&mut self, time: TimeOfDay) {
+        let day = Self::default();
+        (self.sun_direction, self.sunlight, self.skylight, self.sky_top, self.sky_bottom) = match time {
+            TimeOfDay::Day => (day.sun_direction, day.sunlight, day.skylight, day.sky_top, day.sky_bottom),
+            TimeOfDay::Sunset => ([-1.0, 0.22, 0.3], [1.0, 0.66, 0.42], [0.32, 0.3, 0.42], [0.3, 0.4, 0.66], [0.98, 0.7, 0.48]),
+            TimeOfDay::Night => ([0.35, 1.0, -0.45], [0.13, 0.16, 0.26], [0.035, 0.045, 0.08], [0.015, 0.02, 0.06], [0.06, 0.08, 0.16]),
+        };
     }
 }
 
@@ -55,7 +121,8 @@ impl Default for Lighting {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GpuVertex {
     position: [f32; 3],
-    /// xyz: normal; w: 127 for slice caps, see `sliced_away` in shader.wgsl.
+    /// xyz: normal; w: block light * 2, plus 1 for slice caps (see
+    /// `unpack_flags` in shader.wgsl).
     normal: [i8; 4],
     /// Atlas UV in 1/65535 steps.
     uv: [u16; 2],
@@ -71,9 +138,11 @@ impl GpuVertex {
         let snorm = |c: f32| (c.clamp(-1.0, 1.0) * 127.0).round() as i8;
         let unorm16 = |c: f32| (c.clamp(0.0, 1.0) * 65535.0).round() as u16;
         let [r, g, b, _] = v.color;
+        // Block light and the cap flag share the spare normal byte.
+        let flags = (v.block_light.min(15) * 2 + cap as u8) as i8;
         GpuVertex {
             position: v.position,
-            normal: [snorm(v.normal[0]), snorm(v.normal[1]), snorm(v.normal[2]), if cap { 127 } else { 0 }],
+            normal: [snorm(v.normal[0]), snorm(v.normal[1]), snorm(v.normal[2]), flags],
             uv: [unorm16(v.uv[0]), unorm16(v.uv[1])],
             color: [r, g, b, (v.ao.clamp(0.0, 1.0) * 255.0).round() as u8],
             block_y: v.block_y as f32,
@@ -93,6 +162,10 @@ struct Globals {
     ground: [f32; 4],
     params: [f32; 4],
     slice: [f32; 4],
+    camera: [f32; 4],
+    sunlight: [f32; 4],
+    skylight: [f32; 4],
+    block_light: [f32; 4],
 }
 
 struct GpuLayer {
@@ -100,6 +173,42 @@ struct GpuLayer {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     count: u32,
+}
+
+/// A 2D texture with the given mip levels (largest first), as a view.
+fn upload(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    format: wgpu::TextureFormat,
+    levels: impl Iterator<Item = (u32, u32, Vec<u8>)>,
+) -> wgpu::TextureView {
+    let levels: Vec<_> = levels.collect();
+    let (width, height, _) = levels[0];
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: levels.len() as u32,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (level, (width, height, rgba)) in levels.iter().enumerate() {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: level as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: None },
+            wgpu::Extent3d { width: *width, height: *height, depth_or_array_layers: 1 },
+        );
+    }
+    texture.create_view(&Default::default())
 }
 
 /// Split a layer into runs of whole triangles whose vertex and index buffers
@@ -164,6 +273,8 @@ pub struct Renderer {
     light: (Mat4, f32),
     /// Topmost block layer shown, see [`Renderer::set_slice`].
     slice: Option<i32>,
+    /// Whether the current atlas has LabPBR maps.
+    pbr_maps: bool,
 }
 
 impl Renderer {
@@ -171,6 +282,16 @@ impl Renderer {
     /// It should be an sRGB format so output is gamma encoded.
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+        let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                multisampled: false,
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+            },
+            count: None,
+        };
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("globals"),
             entries: &[
@@ -200,6 +321,9 @@ impl Renderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // LabPBR normal and specular maps.
+                texture_entry(3),
+                texture_entry(4),
             ],
         });
         let shadow_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -396,6 +520,7 @@ impl Renderer {
             bounds: None,
             light: (Mat4::IDENTITY, 0.0),
             slice: None,
+            pbr_maps: false,
         }
     }
 
@@ -450,32 +575,19 @@ impl Renderer {
         self.layers.clear();
         self.bounds = None;
 
-        let size = wgpu::Extent3d { width: atlas.width, height: atlas.height, depth_or_array_layers: 1 };
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("atlas"),
-            size,
-            mip_level_count: atlas.mip_levels,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let levels = std::iter::once((atlas.width, atlas.height, atlas.rgba.clone())).chain(atlas.mip_chain());
-        for (level, (width, height, rgba)) in levels.enumerate() {
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture,
-                    mip_level: level as u32,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &rgba,
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: None },
-                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            );
-        }
-        let view = texture.create_view(&Default::default());
+        let base = (atlas.width, atlas.height, atlas.rgba.clone());
+        let view = upload(device, queue, "atlas", wgpu::TextureFormat::Rgba8UnormSrgb, std::iter::once(base).chain(atlas.mip_chain()));
+        // Without maps, 1x1 stand-ins keep the bind group valid.
+        let [normal, specular] = match &atlas.pbr {
+            Some(pbr) => [("normal map", &pbr.normal), ("specular map", &pbr.specular)].map(|(label, layer)| {
+                let base = (atlas.width, atlas.height, layer.clone());
+                upload(device, queue, label, wgpu::TextureFormat::Rgba8Unorm, std::iter::once(base).chain(atlas.data_mip_chain(layer)))
+            }),
+            None => [("normal map", [128, 128, 255, 255]), ("specular map", [0; 4])].map(|(label, texel)| {
+                upload(device, queue, label, wgpu::TextureFormat::Rgba8Unorm, std::iter::once((1, 1, texel.to_vec())))
+            }),
+        };
+        self.pbr_maps = atlas.pbr.is_some();
         self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("globals"),
             layout: &self.bind_group_layout,
@@ -483,6 +595,8 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 0, resource: self.globals.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&normal) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&specular) },
             ],
         }));
         // Without bounds this only makes sure a (placeholder) shadow map exists.
@@ -574,7 +688,7 @@ impl Renderer {
         // Deep enough to reach the ground shadow even with a low sun.
         let proj = glam::camera::rh::proj::directx::orthographic(-radius, radius, -radius, radius, 0.0, radius * 8.0);
         self.light = (proj * view, 2.0 * radius / size as f32);
-        queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&self.globals_data(Mat4::IDENTITY)));
+        queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&self.globals_data(Mat4::IDENTITY, Vec3::ZERO)));
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("shadow map") });
         {
@@ -611,7 +725,7 @@ impl Renderer {
         Vec3::from(self.lighting.sun_direction).try_normalize().unwrap_or(Vec3::Y)
     }
 
-    fn globals_data(&self, view_proj: Mat4) -> Globals {
+    fn globals_data(&self, view_proj: Mat4, eye: Vec3) -> Globals {
         let l = &self.lighting;
         let linear = |c: [f32; 3]| [c[0].powf(2.2), c[1].powf(2.2), c[2].powf(2.2), 1.0];
         let sun = self.sun();
@@ -633,6 +747,10 @@ impl Renderer {
             ground,
             params: [l.ambient_occlusion, l.shadow_strength, self.light.1, 1.0 / shadow_size],
             slice: [self.slice.map_or(f32::MAX, |y| y as f32), 0.0, 0.0, 0.0],
+            camera: [eye.x, eye.y, eye.z, if l.pbr && self.pbr_maps { 1.0 } else { 0.0 }],
+            sunlight: [l.sunlight[0], l.sunlight[1], l.sunlight[2], 0.0],
+            skylight: [l.skylight[0], l.skylight[1], l.skylight[2], 0.0],
+            block_light: [l.block_light[0], l.block_light[1], l.block_light[2], 0.0],
         }
     }
 
@@ -672,7 +790,7 @@ impl Renderer {
         camera: &OrbitCamera,
     ) {
         let view_proj = camera.view_proj(width as f32 / height.max(1) as f32);
-        queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&self.globals_data(view_proj)));
+        queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&self.globals_data(view_proj, camera.eye())));
 
         self.targets(device, width, height);
         let targets = self.targets.as_ref().unwrap();
@@ -728,7 +846,7 @@ mod tests {
     use mesher::Vertex;
 
     fn quads(n: u32) -> MeshLayer {
-        let v = Vertex { position: [0.0; 3], normal: [0.0; 3], uv: [0.0; 2], color: [255; 4], ao: 1.0, block_y: 0 };
+        let v = Vertex { position: [0.0; 3], normal: [0.0; 3], uv: [0.0; 2], color: [255; 4], ao: 1.0, block_y: 0, block_light: 0 };
         let indices = (0..n).flat_map(|q| [0, 1, 2, 0, 2, 3].map(|i| q * 4 + i)).collect();
         MeshLayer { vertices: vec![v; n as usize * 4], indices }
     }

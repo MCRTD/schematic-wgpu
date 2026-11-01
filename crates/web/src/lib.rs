@@ -199,11 +199,17 @@ struct Shutdown {
     waiting: Vec<js_sys::Function>,
 }
 
+/// A resource pack or mod jar added by the user.
+struct Pack {
+    name: String,
+    source: Arc<ZipSource<Cursor<Vec<u8>>>>,
+}
+
 #[derive(Default)]
 struct State {
     vanilla: Option<Arc<MemorySource>>,
-    /// User resource packs, highest priority first.
-    packs: Vec<Arc<ZipSource<Cursor<Vec<u8>>>>>,
+    /// User resource packs and mod jars, highest priority first.
+    packs: Vec<Pack>,
     schematic: Option<Rc<Litematic>>,
     /// Bounds and triangle count of the model shown, once fully meshed.
     shown: Option<([[f32; 3]; 2], usize)>,
@@ -221,7 +227,7 @@ impl State {
         }
         let mut stack = PackStack::new();
         for pack in &self.packs {
-            stack.push(pack.clone());
+            stack.push(pack.source.clone());
         }
         if let Some(vanilla) = &self.vanilla {
             stack.push(vanilla.clone());
@@ -303,9 +309,42 @@ impl App {
         self.rebuild()
     }
 
-    /// Add a resource pack zip on top of the others.
-    pub fn add_pack(&self, zip: Vec<u8>) -> Result<js_sys::Promise, JsError> {
-        self.state.borrow_mut().packs.insert(0, Arc::new(ZipSource::from_bytes(zip)?));
+    /// Add a resource pack zip, or a mod jar for its blocks, on top of the
+    /// others. `name` is only for [`App::packs`].
+    pub fn add_pack(&self, name: String, zip: Vec<u8>) -> Result<js_sys::Promise, JsError> {
+        let source = Arc::new(ZipSource::from_bytes(zip)?);
+        self.state.borrow_mut().packs.insert(0, Pack { name, source });
+        Ok(self.rebuild())
+    }
+
+    /// Names of the added packs, highest priority first: where several have
+    /// the same model or texture, the first one's is used.
+    #[wasm_bindgen(getter)]
+    pub fn packs(&self) -> Vec<String> {
+        self.state.borrow().packs.iter().map(|p| p.name.clone()).collect()
+    }
+
+    /// Move the pack at `from` to position `to` in [`App::packs`].
+    pub fn move_pack(&self, from: usize, to: usize) -> Result<js_sys::Promise, JsError> {
+        {
+            let mut state = self.state.borrow_mut();
+            if from >= state.packs.len() || to >= state.packs.len() {
+                return Err(JsError::new("no such pack"));
+            }
+            let pack = state.packs.remove(from);
+            state.packs.insert(to, pack);
+        }
+        Ok(self.rebuild())
+    }
+
+    pub fn remove_pack(&self, index: usize) -> Result<js_sys::Promise, JsError> {
+        {
+            let mut state = self.state.borrow_mut();
+            if index >= state.packs.len() {
+                return Err(JsError::new("no such pack"));
+            }
+            state.packs.remove(index);
+        }
         Ok(self.rebuild())
     }
 
@@ -348,6 +387,14 @@ impl App {
     pub fn set_layer(&self, layer: Option<u32>) {
         let bottom = self.state.borrow().shown.map_or(0, |([min, _], _)| min[1] as i32);
         let _ = self.viewer.send_event(UserEvent::SetSlice(layer.map(|n| bottom + n as i32 - 1)));
+    }
+
+    /// Light the scene as at `time`: `day`, `sunset` or `night`. At night
+    /// torches, lanterns and other light sources light up their surroundings.
+    pub fn set_time(&self, time: &str) -> Result<(), JsError> {
+        let time = time.parse().map_err(|e: String| JsError::new(&e))?;
+        let _ = self.viewer.send_event(UserEvent::SetTime(time));
+        Ok(())
     }
 
     /// The current model as a binary glTF file.
@@ -410,7 +457,7 @@ async fn rebuild(
     };
     let superseded = || state.borrow().generation != generation || shutdown.borrow().done;
 
-    let options = mesher::Options { slice_caps: true, ..Default::default() };
+    let options = mesher::Options { slice_caps: true, pbr_maps: true, ..Default::default() };
     let mut build = Mesher::new(&mut assets, options).prepare(&lit);
     // Every texture is in the atlas now; the packs' caches can go.
     drop(assets);

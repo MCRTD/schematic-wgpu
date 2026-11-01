@@ -2,17 +2,19 @@
 
 pub mod atlas;
 pub mod bake;
+mod block_entity;
+mod light;
 mod tint;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use glam::Vec3;
-use litematic::{BlockState, Litematic, Region, Vec3i};
+use litematic::{BlockState, Litematic, Nbt, Region, Vec3i};
 use mc_assets::{Assets, Direction, Texture};
 pub use mc_assets::Transparency;
 
-pub use atlas::Atlas;
+pub use atlas::{Atlas, PbrMaps};
 use bake::Quad;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -31,6 +33,9 @@ pub struct Vertex {
     /// layer by layer. Parts of a model that stick out of its block still
     /// count as that block's layer.
     pub block_y: i32,
+    /// Light from torches, lanterns and other light sources reaching this
+    /// corner, 0..=15 as in Minecraft; see [`Options::block_light`].
+    pub block_light: u8,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -127,11 +132,17 @@ pub struct Options {
     pub ambient_occlusion: bool,
     /// Fill [`Mesh::caps`], for viewers that show the build layer by layer.
     pub slice_caps: bool,
+    /// Read each texture's LabPBR maps (`<texture>_n` and `_s`) into
+    /// [`Atlas::pbr`], for renderers that use them.
+    pub pbr_maps: bool,
+    /// Spread light from light-emitting blocks into [`Vertex::block_light`];
+    /// otherwise it is 0.
+    pub block_light: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { placeholder_for_missing: true, bake_tint: false, ambient_occlusion: true, slice_caps: false }
+        Self { placeholder_for_missing: true, bake_tint: false, ambient_occlusion: true, slice_caps: false, pbr_maps: false, block_light: true }
     }
 }
 
@@ -157,6 +168,8 @@ struct BakedState {
     tint: [u8; 3],
     /// Liquids hide faces touching the same liquid at any level.
     fluid: Option<&'static str>,
+    /// Block light the block gives off, 0..=15.
+    emission: u8,
     /// Counted in [`Report::skipped`].
     reported: bool,
     skip: bool,
@@ -169,6 +182,8 @@ pub struct Mesher<'a> {
     assets: &'a mut Assets,
     options: Options,
     sprites: Vec<Arc<Texture>>,
+    /// LabPBR maps of each sprite, with [`Options::pbr_maps`].
+    sprite_maps: Vec<atlas::SpriteMaps>,
     /// Keyed by texture and, with [`Options::bake_tint`], the baked tint.
     sprite_ids: HashMap<(Option<String>, Option<[u8; 3]>), u32>,
     missing_sprite: Option<u32>,
@@ -181,6 +196,7 @@ impl<'a> Mesher<'a> {
             assets,
             options,
             sprites: Vec::new(),
+            sprite_maps: Vec::new(),
             sprite_ids: HashMap::new(),
             missing_sprite: None,
             report: Report::default(),
@@ -201,12 +217,48 @@ impl<'a> Mesher<'a> {
     /// [`Build::fill`]. That keeps memory bounded for builds too large to
     /// hold as one [`Mesh`].
     pub fn prepare(mut self, schematic: &Litematic) -> Build {
-        let baked = schematic.regions.iter().map(|r| r.palette.iter().map(|s| self.bake_state(s)).collect()).collect();
+        let mut baked = Vec::new();
+        let mut variants = Vec::new();
+        let mut lights = Vec::new();
+        for region in &schematic.regions {
+            let mut states: Vec<BakedState> = region.palette.iter().map(|s| self.bake_state(s, None)).collect();
+            // Blocks whose block entity data changes their look (banner
+            // patterns) get extra states after the palette's.
+            let mut by_block = HashMap::new();
+            let mut by_look = HashMap::new();
+            for entity in &region.block_entities {
+                let p = entity.pos;
+                let inside = (0..region.size.x).contains(&p.x) && (0..region.size.y).contains(&p.y) && (0..region.size.z).contains(&p.z);
+                if !inside {
+                    continue;
+                }
+                let i = region.index(p.x, p.y, p.z);
+                let palette_index = region.blocks[i];
+                let state = &region.palette[palette_index as usize];
+                let Some(key) = block_entity::variant_key(state, &entity.nbt) else { continue };
+                let index = *by_look.entry((palette_index, key)).or_insert_with(|| {
+                    states.push(self.bake_state(state, Some(&entity.nbt)));
+                    states.len() - 1
+                });
+                by_block.insert(i, index);
+            }
+            let palette_emission: Vec<u8> = states[..region.palette.len()].iter().map(|s| s.emission).collect();
+            let block_light = if self.options.block_light && palette_emission.iter().any(|&e| e > 0) {
+                light::spread(region, |i| palette_emission[region.blocks[i] as usize], |c| occludes(region, &states, c))
+            } else {
+                light::LightMap::new()
+            };
+            baked.push(states);
+            variants.push(by_block);
+            lights.push(block_light);
+        }
         Build {
-            atlas: Atlas::pack(&self.sprites),
+            atlas: Atlas::pack_with_pbr(&self.sprites, &self.sprite_maps),
             transparency: self.sprites.iter().map(|s| s.transparency).collect(),
             options: self.options,
             baked,
+            variants,
+            lights,
             report: self.report,
             bounds: [Vec3::MAX, Vec3::MIN],
             region: 0,
@@ -223,16 +275,43 @@ impl<'a> Mesher<'a> {
             return id;
         }
         let texture = key.0;
-        let id = match texture.as_deref().and_then(|t| self.assets.texture(t)) {
-            Some(loaded) => self.push_sprite(loaded),
-            None => {
-                if let Some(t) = &texture {
-                    self.report.missing_textures.push(t.clone());
+        let loaded = match texture.as_deref() {
+            Some(t) if t.starts_with('+') => {
+                let assets = &mut *self.assets;
+                block_entity::compose(&t[1..], |l| assets.texture(l), &mut self.report.missing_textures).map(Arc::new)
+            }
+            Some(t) => {
+                let loaded = self.assets.texture(t);
+                if loaded.is_none() {
+                    self.report.missing_textures.push(t.to_owned());
                 }
+                loaded
+            }
+            None => None,
+        };
+        let maps = match (&loaded, texture.as_deref()) {
+            (Some(_), Some(t)) if self.options.pbr_maps && !t.starts_with('+') => {
+                [self.assets.texture(&format!("{t}_n")), self.assets.texture(&format!("{t}_s"))]
+            }
+            _ => [None, None],
+        };
+        let id = match loaded {
+            Some(loaded) => {
+                // Packs often add detailed maps to the vanilla colors; keep
+                // the maps' detail by enlarging the color sprite.
+                let widest = maps.iter().flatten().map(|m| m.width).max().unwrap_or(0);
+                let loaded = if widest > loaded.width && widest % loaded.width == 0 {
+                    Arc::new(enlarged(&loaded, widest / loaded.width))
+                } else {
+                    loaded
+                };
+                self.push_sprite(loaded, maps)
+            }
+            None => {
                 match self.missing_sprite {
                     Some(id) => id,
                     None => {
-                        let id = self.push_sprite(Arc::new(Texture::missing()));
+                        let id = self.push_sprite(Arc::new(Texture::missing()), [None, None]);
                         self.missing_sprite = Some(id);
                         id
                     }
@@ -258,13 +337,15 @@ impl<'a> Mesher<'a> {
             }
         }
         let tinted = Texture::from_rgba(source.width, source.height, rgba);
-        let id = self.push_sprite(Arc::new(tinted));
+        let maps = self.sprite_maps[base as usize].clone();
+        let id = self.push_sprite(Arc::new(tinted), maps);
         self.sprite_ids.insert(key, id);
         id
     }
 
-    fn push_sprite(&mut self, texture: Arc<Texture>) -> u32 {
+    fn push_sprite(&mut self, texture: Arc<Texture>, maps: atlas::SpriteMaps) -> u32 {
         self.sprites.push(texture);
+        self.sprite_maps.push(maps);
         self.sprites.len() as u32 - 1
     }
 
@@ -272,7 +353,8 @@ impl<'a> Mesher<'a> {
         self.report.skipped.entry(state.name.clone()).or_insert((reason, 0));
     }
 
-    fn bake_state(&mut self, state: &BlockState) -> BakedState {
+    /// `nbt` is the block entity data of a block that [`block_entity::variant_key`] picked out.
+    fn bake_state(&mut self, state: &BlockState, nbt: Option<&Nbt>) -> BakedState {
         if state.is_air() {
             return BakedState { skip: true, ..Default::default() };
         }
@@ -280,18 +362,30 @@ impl<'a> Mesher<'a> {
         let mut reported = false;
         let quads: Vec<Vec<(u32, Vec<Quad>)>> = if LIQUIDS.contains(&name) {
             vec![vec![(1, liquid_quads(name, &state.properties))]]
+        } else if let Some(nbt) = nbt
+            && let Some(quads) = block_entity::quads(state, Some(nbt))
+        {
+            vec![vec![(1, quads)]]
         } else {
-            match self.assets.resolve(&state.name, &state.properties) {
-                Ok(parts) => parts
+            let resolved = self.assets.resolve(&state.name, &state.properties).map(|parts| {
+                parts
                     .iter()
-                    .map(|choices| choices.iter().map(|m| (m.weight, bake::bake(m))).collect())
-                    .collect(),
-                Err(e) if self.options.placeholder_for_missing => {
+                    .map(|choices| choices.iter().map(|m| (m.weight, bake::bake(m))).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            });
+            // Blocks drawn by code have no model geometry; packs may still
+            // give them some, which then wins.
+            let geometry = matches!(&resolved, Ok(parts) if parts.iter().flatten().any(|(_, q)| !q.is_empty()));
+            let entity = if geometry { None } else { block_entity::quads(state, None) };
+            match (entity, resolved) {
+                (Some(quads), _) => vec![vec![(1, quads)]],
+                (None, Ok(parts)) => parts,
+                (None, Err(e)) if self.options.placeholder_for_missing => {
                     reported = true;
                     self.report_skip(state, e.to_string());
                     vec![vec![(1, placeholder_cube())]]
                 }
-                Err(e) => {
+                (None, Err(e)) => {
                     self.report_skip(state, e.to_string());
                     return BakedState { skip: true, reported: true, ..Default::default() };
                 }
@@ -341,6 +435,7 @@ impl<'a> Mesher<'a> {
             occludes: fluid.is_none() && opaque_sides.iter().all(|&o| o),
             tint,
             fluid,
+            emission: light::emission(state),
             reported,
             skip: false,
         }
@@ -353,8 +448,12 @@ pub struct Build {
     /// By sprite index.
     transparency: Vec<Transparency>,
     options: Options,
-    /// By region, then palette index.
+    /// By region, then palette index; then variants of palette entries.
     baked: Vec<Vec<BakedState>>,
+    /// By region: block index → index in `baked` of its variant.
+    variants: Vec<HashMap<usize, usize>>,
+    /// By region: block light levels.
+    lights: Vec<light::LightMap>,
     report: Report,
     bounds: [Vec3; 2],
     /// Next block to mesh: region and index into its blocks.
@@ -386,7 +485,7 @@ impl Build {
                 self.next += 1;
                 self.done += 1;
                 let index = region.blocks[i] as usize;
-                let state = &baked[index];
+                let state = &baked[self.variants[self.region].get(&i).copied().unwrap_or(index)];
                 if state.reported {
                     let name = &region.palette[index].name;
                     if let Some(entry) = self.report.skipped.get_mut(name) {
@@ -422,6 +521,11 @@ impl Build {
                         } else {
                             [1.0; 4]
                         };
+                        let light = if self.options.block_light {
+                            vertex_light(region, baked, &self.lights[self.region], pos, quad, state.emission)
+                        } else {
+                            [0; 4]
+                        };
                         let corners = std::array::from_fn(|i| Vertex {
                             position: (block_pos + quad.positions[i]).into(),
                             normal: quad.normal.into(),
@@ -429,6 +533,7 @@ impl Build {
                             color: [r, g, b, 255],
                             ao: ao[i],
                             block_y: region.origin.y + pos.y,
+                            block_light: light[i],
                         });
                         let layer = if cap { &mut mesh.caps[transparency as usize] } else { mesh.layer_mut(transparency) };
                         layer.push_quad(corners);
@@ -459,8 +564,22 @@ impl Build {
 
     pub fn finish(mut self) -> (Atlas, Report) {
         self.report.missing_textures.sort();
+        self.report.missing_textures.dedup();
         (self.atlas, self.report)
     }
+}
+
+/// `texture` with every texel repeated `factor` times in each direction.
+fn enlarged(texture: &Texture, factor: u32) -> Texture {
+    let (width, height) = (texture.width * factor, texture.height * factor);
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let i = (((y / factor) * texture.width + x / factor) * 4) as usize;
+            rgba.extend_from_slice(&texture.rgba[i..i + 4]);
+        }
+    }
+    Texture::from_rgba(width, height, rgba)
 }
 
 /// Deterministically choose a weighted variant based on block position.
@@ -538,6 +657,45 @@ fn vertex_ao(region: &Region, baked: &[BakedState], pos: Vec3i, quad: &Quad) -> 
     })
 }
 
+/// Block light at each corner of a quad. Like [`vertex_ao`], axis-aligned
+/// quads average the cells around each corner in the layer they face, for
+/// smooth lighting; other quads take their own cell's level. A light source
+/// is at least as bright as its own `emission`.
+fn vertex_light(region: &Region, baked: &[BakedState], light: &light::LightMap, pos: Vec3i, quad: &Quad, emission: u8) -> [u8; 4] {
+    if light.is_empty() {
+        return [emission; 4];
+    }
+    let level = |c: [i32; 3]| light.get(&c).copied().unwrap_or(0);
+    let own = [pos.x, pos.y, pos.z];
+    let n = quad.normal;
+    let Some(axis) = (0..3).find(|&a| n[a].abs() > 0.999) else { return [level(own).max(emission); 4] };
+    let sign = n[axis].signum() as i32;
+    let (t1, t2) = ((axis + 1) % 3, (axis + 2) % 3);
+    let plane = quad.positions[0][axis];
+    let on_boundary = if sign > 0 { plane > 1.0 - 1e-4 } else { plane < 1e-4 };
+    let mut front = own;
+    if on_boundary {
+        front[axis] += sign;
+    }
+
+    quad.positions.map(|p| {
+        let d1 = if p[t1] > 0.5 { 1 } else { -1 };
+        let d2 = if p[t2] > 0.5 { 1 } else { -1 };
+        let (mut sum, mut count) = (level(front) as u32, 1);
+        // Cells inside solid blocks are dark and don't count.
+        for (a, b) in [(d1, 0), (0, d2), (d1, d2)] {
+            let mut c = front;
+            c[t1] += a;
+            c[t2] += b;
+            if !occludes(region, baked, c) {
+                sum += level(c) as u32;
+                count += 1;
+            }
+        }
+        (((sum + count / 2) / count) as u8).max(emission)
+    })
+}
+
 fn placeholder_cube() -> Vec<Quad> {
     cube_quads(1.0, None)
 }
@@ -600,6 +758,10 @@ mod tests {
     }
 
     fn assets() -> Assets {
+        Assets::new(base_pack())
+    }
+
+    fn base_pack() -> MemorySource {
         let mut src = MemorySource::default();
         let cube_all = r##"{"elements": [{"from": [0,0,0], "to": [16,16,16], "faces": {
             "down": {"texture": "#all", "cullface": "down"}, "up": {"texture": "#all", "cullface": "up"},
@@ -621,7 +783,7 @@ mod tests {
                 "down": {"texture": "#all", "cullface": "down"}, "up": {"texture": "#all"},
                 "north": {"texture": "#all", "cullface": "north"}}}]}"##,
         );
-        Assets::new(src)
+        src
     }
 
     fn state(name: &str, props: &[(&str, &str)]) -> BlockState {
@@ -647,7 +809,14 @@ mod tests {
                 time_created: 0,
                 time_modified: 0,
             },
-            regions: vec![Region { name: "r".into(), origin: Vec3i { x: 10, y: 0, z: 0 }, size, palette, blocks }],
+            regions: vec![Region {
+                name: "r".into(),
+                origin: Vec3i { x: 10, y: 0, z: 0 },
+                size,
+                palette,
+                blocks,
+                block_entities: Vec::new(),
+            }],
         }
     }
 
@@ -736,6 +905,116 @@ mod tests {
         assert_eq!(vertices(|m| &m.opaque), whole.opaque.vertices);
         assert_eq!(vertices(|m| &m.cutout), whole.cutout.vertices);
         assert_eq!(build.finish().0.rects, whole.atlas.unwrap().rects);
+    }
+
+    #[test]
+    fn mod_blocks_and_pack_priority() {
+        // A mod jar's block, built on a vanilla parent model, and a pack
+        // above both that retextures stone.
+        let mut mod_jar = MemorySource::default();
+        mod_jar
+            .insert("assets/testmod/blockstates/gear.json", r#"{"variants": {"": {"model": "testmod:block/gear"}}}"#)
+            .insert("assets/testmod/models/block/gear.json", r#"{"parent": "minecraft:block/cube_all", "textures": {"all": "testmod:block/gear"}}"#)
+            .insert("assets/testmod/textures/block/gear.png", png([0, 255, 0, 255]));
+        let mut pack = MemorySource::default();
+        pack.insert("assets/minecraft/textures/block/stone.png", png([255, 0, 0, 255]));
+        let mut stack = mc_assets::PackStack::new();
+        stack.push(pack).push(mod_jar).push(base_pack());
+        let mut assets = Assets::new(stack);
+
+        let palette = vec![state("stone", &[]), BlockState { name: "testmod:gear".into(), properties: BTreeMap::new() }];
+        let lit = schematic(Vec3i { x: 2, y: 1, z: 1 }, palette, vec![0, 1]);
+        let (mesh, report) = Mesher::new(&mut assets, Options::default()).build(&lit);
+        assert!(report.skipped.is_empty() && report.missing_textures.is_empty(), "{report:?}");
+        let atlas = mesh.atlas.as_ref().unwrap();
+        // The texel in the middle of the south face touching `x`.
+        let color = |x: f32| {
+            let vertices = &mesh.opaque.vertices;
+            let i = vertices.iter().position(|v| v.position[0] == x && v.normal == [0.0, 0.0, 1.0]).unwrap();
+            let quad = &vertices[i / 4 * 4..][..4];
+            let uv = quad.iter().fold([0.0; 2], |a, w| [a[0] + w.uv[0] / 4.0, a[1] + w.uv[1] / 4.0]);
+            let (px, py) = ((uv[0] * atlas.width as f32) as u32, (uv[1] * atlas.height as f32) as u32);
+            atlas.rgba[((py * atlas.width + px) * 4) as usize..][..3].to_vec()
+        };
+        // Stone at x 10..11 comes from the top pack, the gear at 11..12 from the mod.
+        assert_eq!(color(10.0), [255, 0, 0]);
+        assert_eq!(color(12.0), [0, 255, 0]);
+    }
+
+    #[test]
+    fn block_entities_are_drawn_and_banners_get_their_patterns() {
+        let mut pack = base_pack();
+        for t in ["entity/chest/normal", "entity/banner/banner_base", "entity/banner/base", "entity/banner/border"] {
+            pack.insert(format!("assets/minecraft/textures/{t}.png"), png([255, 255, 255, 255]));
+        }
+        let mut assets = Assets::new(pack);
+        let palette = vec![state("chest", &[("facing", "north")]), state("red_banner", &[("rotation", "0")])];
+        let mut lit = schematic(Vec3i { x: 3, y: 1, z: 1 }, palette, vec![0, 1, 1]);
+        // The second banner has a pattern, the first none.
+        let pattern = Nbt::Compound([("pattern".into(), Nbt::String("minecraft:border".into())), ("color".into(), Nbt::String("blue".into()))].into());
+        lit.regions[0].block_entities.push(litematic::BlockEntity {
+            pos: Vec3i { x: 2, y: 0, z: 0 },
+            nbt: Nbt::Compound([("patterns".into(), Nbt::List(vec![pattern]))].into()),
+        });
+        let (mesh, report) = Mesher::new(&mut assets, Options::default()).build(&lit);
+        assert!(report.skipped.is_empty() && report.missing_textures.is_empty(), "{report:?}");
+        // Chest: 3 boxes; each banner: flag, bar and pole.
+        assert_eq!(mesh.opaque.indices.len() / 6, 18 + 2 * 18);
+        // Plain red flag, flag with a blue border, banner sheet, chest.
+        assert_eq!(mesh.atlas.unwrap().rects.len(), 4);
+    }
+
+    #[test]
+    fn pbr_maps_are_read_and_enlarge_their_sprite() {
+        let mut pack = base_pack();
+        let big = image::RgbaImage::from_pixel(64, 64, image::Rgba([1, 2, 3, 4]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        big.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        pack.insert("assets/minecraft/textures/block/stone_s.png", bytes.into_inner());
+        let lit = schematic(Vec3i { x: 1, y: 1, z: 1 }, vec![state("stone", &[])], vec![0]);
+        let pack = Arc::new(pack);
+
+        let (plain, _) = Mesher::new(&mut Assets::new(pack.clone()), Options::default()).build(&lit);
+        assert!(plain.atlas.unwrap().pbr.is_none());
+        let options = Options { pbr_maps: true, ..Default::default() };
+        let (mesh, report) = Mesher::new(&mut Assets::new(pack), options).build(&lit);
+        assert!(report.missing_textures.is_empty());
+        let atlas = mesh.atlas.unwrap();
+        // The 16px stone sprite became 64px to match its map.
+        assert_eq!((atlas.rects[0].size[0] * atlas.width as f32) as u32, 64);
+        let pbr = atlas.pbr.unwrap();
+        let [u, v] = atlas.rects[0].map([0.5, 0.5]);
+        let i = (((v * atlas.height as f32) as u32 * atlas.width + (u * atlas.width as f32) as u32) * 4) as usize;
+        assert_eq!(&pbr.specular[i..i + 4], &[1, 2, 3, 4]);
+        assert_eq!(&atlas.rgba[i..i + 4], &[128, 128, 128, 255]);
+    }
+
+    #[test]
+    fn torches_light_up_nearby_faces() {
+        let mut pack = base_pack();
+        pack.insert("assets/minecraft/blockstates/torch.json", r#"{"variants": {"": {"model": "block/stone"}}}"#);
+        let mut assets = Assets::new(pack);
+        // Stone floor of 5, a light source on the first block.
+        let palette = vec![state("air", &[]), state("stone", &[]), state("torch", &[])];
+        let lit = schematic(Vec3i { x: 5, y: 2, z: 1 }, palette, vec![1, 1, 1, 1, 1, 2, 0, 0, 0, 0]);
+        let (mesh, _) = Mesher::new(&mut assets, Options::default()).build(&lit);
+        // Average light on the top of each floor block (the torch's block hides
+        // the first one's top).
+        let top = |x: f32| {
+            let v: Vec<u8> = mesh.opaque.vertices.iter()
+                .filter(|v| v.normal == [0.0, 1.0, 0.0] && v.position[1] == 1.0 && v.position[0] >= x && v.position[0] <= x + 1.0)
+                .map(|v| v.block_light)
+                .collect();
+            v.iter().map(|&l| l as f32).sum::<f32>() / v.len() as f32
+        };
+        let (a, b, c) = (top(11.0), top(12.0), top(14.0));
+        assert!(a > b && b > c && c > 0.0, "{a} {b} {c}");
+        // The source itself is fully bright.
+        assert!(mesh.opaque.vertices.iter().filter(|v| v.position[1] > 1.5).all(|v| v.block_light == 14));
+
+        let options = Options { block_light: false, ..Default::default() };
+        let (dark, _) = Mesher::new(&mut Assets::new(base_pack()), options).build(&lit);
+        assert!(dark.opaque.vertices.iter().all(|v| v.block_light == 0));
     }
 
     #[test]

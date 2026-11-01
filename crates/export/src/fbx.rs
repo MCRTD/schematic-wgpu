@@ -567,7 +567,7 @@ mod tests {
     fn test_mesh() -> Mesh {
         use mesher::{Atlas, MeshLayer, Vertex, atlas::Rect};
         let quad = |y: f32, color: [u8; 4]| {
-            let v = |x: f32, z: f32, u: f32, w: f32| Vertex { position: [x, y, z], normal: [0.0, 1.0, 0.0], uv: [u, w], color, ao: 1.0, block_y: 0 };
+            let v = |x: f32, z: f32, u: f32, w: f32| Vertex { position: [x, y, z], normal: [0.0, 1.0, 0.0], uv: [u, w], color, ao: 1.0, block_y: 0, block_light: 0 };
             MeshLayer {
                 vertices: vec![v(0.0, 0.0, 0.0, 0.0), v(0.0, 1.0, 0.0, 0.5), v(1.0, 1.0, 0.5, 0.5), v(1.0, 0.0, 0.5, 0.0)],
                 indices: vec![0, 1, 2, 0, 2, 3],
@@ -588,6 +588,7 @@ mod tests {
                 rgba: [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [9, 9, 9, 100]].concat(),
                 rects: vec![Rect { min: [0.0; 2], size: [0.5; 2] }],
                 mip_levels: 1,
+                pbr: None,
             }),
             bounds: [[0.0; 3], [2.0, 1.0, 1.0]],
             caps: Default::default(),

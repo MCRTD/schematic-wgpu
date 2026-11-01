@@ -144,7 +144,8 @@ impl Litematic {
             if let Some(&index) = blocks.iter().find(|&&i| i as usize >= palette.len()) {
                 return Err(Error::PaletteIndex { region: name, index, len: palette.len() });
             }
-            regions.push(Region { name, origin, size, palette, blocks });
+            // Block entities aren't part of the preview format.
+            regions.push(Region { name, origin, size, palette, blocks, block_entities: Vec::new() });
         }
         if !r.0.is_empty() {
             return Err(Error::Preview("trailing data after the last region".into()));
@@ -268,7 +269,14 @@ mod tests {
                 time_created: 1_700_000_000_000,
                 time_modified: -1,
             },
-            regions: vec![Region { name: "main".into(), origin: Vec3i { x: -2, y: 0, z: 7 }, size, palette, blocks }],
+            regions: vec![Region {
+                name: "main".into(),
+                origin: Vec3i { x: -2, y: 0, z: 7 },
+                size,
+                palette,
+                blocks,
+                block_entities: Vec::new(),
+            }],
         }
     }
 

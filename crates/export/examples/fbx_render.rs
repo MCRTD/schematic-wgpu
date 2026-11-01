@@ -45,6 +45,7 @@ fn main() {
                 color: [255; 4],
                 ao: 1.0,
                 block_y: position[1].floor() as i32,
+                block_light: 0,
             });
         }
         for k in 1..face.num_indices - 1 {
@@ -66,6 +67,7 @@ fn main() {
             rgba: image.into_raw(),
             rects: vec![Rect { min: [0.0; 2], size: [1.0; 2] }],
             mip_levels: 1,
+            pbr: None,
         }),
         bounds: [min, max],
         caps: Default::default(),

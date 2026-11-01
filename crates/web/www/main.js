@@ -17,6 +17,7 @@ const ui = {
   exportGlb: $("export"),
   exportFbx: $("export-fbx"),
   layer: $("layer"),
+  time: $("time"),
   layerLabel: $("layer-label"),
   status: $("status"),
   report: $("report"),
@@ -82,8 +83,66 @@ async function attempt(action) {
 
 await init();
 const app = new App(ui.canvas);
-const packNames = [];
 let haveVanilla = false;
+
+// Packs and mod jars, highest priority first, over the Minecraft assets.
+// Reorder by dragging or with the arrows.
+function renderPacks() {
+  const names = app.packs;
+  const item = (text, className) => {
+    const li = document.createElement("li");
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = name.title = text;
+    li.append(name);
+    if (className) li.className = className;
+    return li;
+  };
+  const button = (text, label, disabled, action) => {
+    const b = document.createElement("button");
+    b.textContent = text;
+    b.title = b.ariaLabel = label;
+    b.disabled = disabled;
+    b.addEventListener("click", () => changePacks(action));
+    return b;
+  };
+  const rows = names.map((text, i) => {
+    const li = item(text);
+    li.draggable = true;
+    li.append(
+      button("↑", "Higher priority", i === 0, () => app.move_pack(i, i - 1)),
+      button("↓", "Lower priority", i === names.length - 1, () => app.move_pack(i, i + 1)),
+      button("✕", "Remove", false, () => app.remove_pack(i)),
+    );
+    li.addEventListener("dragstart", (e) => e.dataTransfer.setData("text/x-pack", String(i)));
+    li.addEventListener("dragover", (e) => {
+      if (!e.dataTransfer.types.includes("text/x-pack")) return;
+      e.preventDefault();
+      li.classList.add("over");
+    });
+    li.addEventListener("dragleave", () => li.classList.remove("over"));
+    li.addEventListener("drop", (e) => {
+      const from = e.dataTransfer.getData("text/x-pack");
+      if (from === "") return;
+      e.preventDefault();
+      e.stopPropagation();
+      li.classList.remove("over");
+      if (Number(from) !== i) changePacks(() => app.move_pack(Number(from), i));
+    });
+    return li;
+  });
+  const base = names.length ? [item(`Minecraft ${ui.version.value || ""}`.trim(), "base")] : [];
+  ui.packs.replaceChildren(...rows, ...base);
+  ui.clearPacks.disabled = names.length === 0;
+}
+
+function changePacks(action) {
+  return attempt(() => {
+    const report = action();
+    renderPacks();
+    return report;
+  });
+}
 
 // Large builds are meshed and shown piece by piece.
 app.set_progress((fraction) => {
@@ -107,6 +166,8 @@ async function loadVersion(version) {
       `Minecraft ${assets.version}: ${assets.files} block assets (${(assets.downloaded / 1e6).toFixed(1)} MB, cached for next time)`,
     );
     haveVanilla = true;
+    // Shows the version under the packs.
+    renderPacks();
     return app.set_vanilla(assets);
   });
   ui.version.disabled = false;
@@ -118,18 +179,12 @@ async function openFiles(files) {
     if (/\.litematic$/i.test(file.name)) {
       await attempt(() => {
         const report = app.load_schematic(bytes);
-        if (!haveVanilla && packNames.length === 0)
+        if (!haveVanilla && app.packs.length === 0)
           status("Schematic loaded; waiting for block assets…");
         return report;
       });
     } else if (/\.(zip|jar)$/i.test(file.name)) {
-      await attempt(() => {
-        const report = app.add_pack(bytes);
-        packNames.unshift(file.name);
-        ui.packs.textContent = packNames.join(" › ");
-        ui.clearPacks.disabled = false;
-        return report;
-      });
+      await changePacks(() => app.add_pack(file.name, bytes));
     } else {
       status(`Unsupported file: ${file.name}`, true);
     }
@@ -144,16 +199,10 @@ ui.drop.addEventListener(
 ui.file.addEventListener("change", () => openFiles(ui.file.files));
 ui.addPack.addEventListener("click", () => ui.packFile.click());
 ui.packFile.addEventListener("change", () => openFiles(ui.packFile.files));
-ui.clearPacks.addEventListener("click", () =>
-  attempt(() => {
-    packNames.length = 0;
-    ui.packs.textContent = "";
-    ui.clearPacks.disabled = true;
-    return app.clear_packs();
-  }),
-);
+ui.clearPacks.addEventListener("click", () => changePacks(() => app.clear_packs()));
 ui.version.addEventListener("change", () => loadVersion(ui.version.value));
 ui.layer.addEventListener("input", showLayer);
+ui.time.addEventListener("change", () => app.set_time(ui.time.value));
 ui.canvas.addEventListener("keydown", (e) => {
   const steps = { PageUp: 1, "]": 1, PageDown: -1, "[": -1 }[e.key];
   if (steps) {
@@ -173,27 +222,34 @@ ui.exportFbx.addEventListener("click", () =>
   ),
 );
 
+// Files dropped anywhere are opened; reordering packs drags no files.
+const hasFiles = (e) => e.dataTransfer?.types.includes("Files");
 let dragDepth = 0;
 window.addEventListener("dragenter", (e) => {
+  if (!hasFiles(e)) return;
   e.preventDefault();
   dragDepth++;
   document.body.classList.add("dragging");
 });
-window.addEventListener("dragleave", () => {
-  if (--dragDepth === 0) document.body.classList.remove("dragging");
+window.addEventListener("dragleave", (e) => {
+  if (hasFiles(e) && --dragDepth === 0) document.body.classList.remove("dragging");
 });
-window.addEventListener("dragover", (e) => e.preventDefault());
+window.addEventListener("dragover", (e) => hasFiles(e) && e.preventDefault());
 window.addEventListener("drop", (e) => {
+  if (!hasFiles(e)) return;
   e.preventDefault();
   dragDepth = 0;
   document.body.classList.remove("dragging");
   openFiles(e.dataTransfer.files);
 });
 
+let versions = null;
 try {
-  const versions = await minecraft_versions();
-  ui.version.replaceChildren(...versions.map((v) => new Option(v, v)));
-  await loadVersion(versions[0]);
+  versions = await minecraft_versions();
 } catch (e) {
   status(`Could not reach Mojang's version list: ${e.message ?? e}`, true);
+}
+if (versions) {
+  ui.version.replaceChildren(...versions.map((v) => new Option(v, v)));
+  await loadVersion(versions[0]);
 }

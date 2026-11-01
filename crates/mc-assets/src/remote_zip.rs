@@ -154,13 +154,33 @@ pub fn extract(span: &Span, data: &[u8]) -> Result<Vec<(String, Vec<u8>)>, ZipEr
         .collect()
 }
 
+/// Entity textures of blocks drawn by block entity renderers (chests,
+/// banners, beds, signs, heads, shulker boxes).
+const BLOCK_ENTITY_TEXTURES: &[&str] = &[
+    "banner/",
+    "banner_base.png",
+    "bed/",
+    "chest/",
+    "creeper/creeper.png",
+    "piglin/piglin.png",
+    "player/wide/steve.png",
+    "shulker/",
+    "signs/",
+    "skeleton/skeleton.png",
+    "skeleton/wither_skeleton.png",
+    "steve.png",
+    "zombie/zombie.png",
+];
+
 /// The parts of a resource pack needed to build block meshes.
 pub fn is_block_asset(path: &str) -> bool {
     let Some(rest) = path.strip_prefix("assets/") else { return false };
     let Some((_, rest)) = rest.split_once('/') else { return false };
+    let texture = rest.ends_with(".png") || rest.ends_with(".mcmeta");
     rest.starts_with("blockstates/")
         || rest.starts_with("models/block/")
-        || (rest.starts_with("textures/block/") && (rest.ends_with(".png") || rest.ends_with(".mcmeta")))
+        || (texture && rest.starts_with("textures/block/"))
+        || (texture && rest.strip_prefix("textures/entity/").is_some_and(|e| BLOCK_ENTITY_TEXTURES.iter().any(|p| e.starts_with(p))))
 }
 
 pub fn into_source(files: impl IntoIterator<Item = (String, Vec<u8>)>) -> MemorySource {
@@ -237,6 +257,10 @@ mod tests {
         assert!(is_block_asset("assets/create/models/block/cog.json"));
         assert!(is_block_asset("assets/minecraft/textures/block/water_still.png.mcmeta"));
         assert!(!is_block_asset("assets/minecraft/textures/item/apple.png"));
+        assert!(is_block_asset("assets/minecraft/textures/entity/chest/normal_left.png"));
+        assert!(is_block_asset("assets/minecraft/textures/entity/player/wide/steve.png"));
+        assert!(!is_block_asset("assets/minecraft/textures/entity/player/slim/alex.png"));
+        assert!(!is_block_asset("assets/minecraft/textures/entity/zombie/drowned.png"));
         assert!(!is_block_asset("assets/minecraft/textures/block/readme.txt"));
         assert!(!is_block_asset("data/minecraft/recipes/stone.json"));
     }
