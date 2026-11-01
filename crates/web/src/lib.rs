@@ -32,6 +32,9 @@ extern "C" {
     /// A text document; `cache` keeps it for later visits.
     #[wasm_bindgen(catch)]
     async fn fetch_text(url: &str, cache: bool) -> Result<JsValue, JsValue>;
+    /// Resolves after the browser had a chance to run other tasks.
+    #[wasm_bindgen(catch)]
+    async fn next_task() -> Result<JsValue, JsValue>;
 }
 
 #[wasm_bindgen(start)]
@@ -182,6 +185,13 @@ pub async fn load_vanilla(version: String, progress: js_sys::Function) -> Result
     Ok(VanillaAssets { version, source: Arc::new(remote_zip::into_source(files)), downloaded })
 }
 
+/// Faces meshed and uploaded at a time, about 100 MB of mesh. A wasm page
+/// can address at most 4 GB, which large builds exceed as a single mesh.
+const CHUNK_QUADS: usize = 500_000;
+/// Larger models aren't exported in the browser: the whole mesh and the
+/// file would both have to fit in that memory.
+const EXPORT_MAX_TRIANGLES: usize = 6_000_000;
+
 /// Whether the viewer's event loop has been torn down, and who is waiting for it.
 #[derive(Default)]
 struct Shutdown {
@@ -189,7 +199,42 @@ struct Shutdown {
     waiting: Vec<js_sys::Function>,
 }
 
+#[derive(Default)]
+struct State {
+    vanilla: Option<Arc<MemorySource>>,
+    /// User resource packs, highest priority first.
+    packs: Vec<Arc<ZipSource<Cursor<Vec<u8>>>>>,
+    schematic: Option<Rc<Litematic>>,
+    /// Bounds and triangle count of the model shown, once fully meshed.
+    shown: Option<([[f32; 3]; 2], usize)>,
+    /// Bumped by every rebuild, so one that is still running stops.
+    generation: u64,
+    /// Called with 0..1 while a model is meshed.
+    progress: Option<js_sys::Function>,
+}
+
+impl State {
+    /// User packs over the vanilla assets, or `None` if neither is loaded.
+    fn assets(&self) -> Option<Assets> {
+        if self.vanilla.is_none() && self.packs.is_empty() {
+            return None;
+        }
+        let mut stack = PackStack::new();
+        for pack in &self.packs {
+            stack.push(pack.clone());
+        }
+        if let Some(vanilla) = &self.vanilla {
+            stack.push(vanilla.clone());
+        }
+        Some(Assets::new(stack))
+    }
+}
+
 /// The page's state: which assets are loaded and which schematic is shown.
+///
+/// Methods that change what is shown return a promise of the mesh report
+/// (or `null` while assets are missing, or if a later change superseded
+/// it). Large builds are meshed and uploaded in pieces, so they take a while.
 ///
 /// Only one `App` can run at a time. Await [`App::destroy`] before creating
 /// the next one, e.g. when a component that shows the viewer unmounts.
@@ -197,11 +242,7 @@ struct Shutdown {
 pub struct App {
     viewer: EventLoopProxy<UserEvent>,
     shutdown: Rc<RefCell<Shutdown>>,
-    vanilla: Option<Arc<MemorySource>>,
-    /// User resource packs, highest priority first.
-    packs: Vec<Arc<ZipSource<Cursor<Vec<u8>>>>>,
-    schematic: Option<Litematic>,
-    mesh: Option<Mesh>,
+    state: Rc<RefCell<State>>,
 }
 
 #[wasm_bindgen]
@@ -228,15 +269,19 @@ impl App {
             }
             e => JsError::new(&e.to_string()),
         })?;
-        Ok(App { viewer, shutdown, vanilla: None, packs: Vec::new(), schematic: None, mesh: None })
+        Ok(App { viewer, shutdown, state: Rc::default() })
     }
 
     /// Stop the viewer and release its canvas and GPU resources. The promise
     /// resolves once a new `App` can be created. Calling it again is harmless;
     /// `free()` the object afterwards as usual.
     pub fn destroy(&mut self) -> js_sys::Promise {
-        self.schematic = None;
-        self.mesh = None;
+        {
+            let mut state = self.state.borrow_mut();
+            state.schematic = None;
+            state.shown = None;
+            state.generation += 1;
+        }
         let shutdown = self.shutdown.clone();
         let promise = js_sys::Promise::new(&mut |resolve, _reject| {
             let mut shutdown = shutdown.borrow_mut();
@@ -252,108 +297,175 @@ impl App {
         promise
     }
 
-    /// Use these Mojang assets as the base pack. Returns a mesh report if a
-    /// schematic is loaded.
-    pub fn set_vanilla(&mut self, assets: &VanillaAssets) -> Result<Option<String>, JsError> {
-        self.vanilla = Some(assets.source.clone());
+    /// Use these Mojang assets as the base pack.
+    pub fn set_vanilla(&self, assets: &VanillaAssets) -> js_sys::Promise {
+        self.state.borrow_mut().vanilla = Some(assets.source.clone());
         self.rebuild()
     }
 
     /// Add a resource pack zip on top of the others.
-    pub fn add_pack(&mut self, zip: Vec<u8>) -> Result<Option<String>, JsError> {
-        self.packs.insert(0, Arc::new(ZipSource::from_bytes(zip)?));
+    pub fn add_pack(&self, zip: Vec<u8>) -> Result<js_sys::Promise, JsError> {
+        self.state.borrow_mut().packs.insert(0, Arc::new(ZipSource::from_bytes(zip)?));
+        Ok(self.rebuild())
+    }
+
+    pub fn clear_packs(&self) -> js_sys::Promise {
+        self.state.borrow_mut().packs.clear();
         self.rebuild()
     }
 
-    pub fn clear_packs(&mut self) -> Result<Option<String>, JsError> {
-        self.packs.clear();
-        self.rebuild()
-    }
-
-    /// Show a `.litematic` file. Returns a report once assets are available.
-    pub fn load_schematic(&mut self, bytes: &[u8]) -> Result<Option<String>, JsError> {
-        self.schematic = Some(Litematic::from_gzip_bytes(bytes)?);
-        self.rebuild()
+    /// Show a `.litematic` file.
+    pub fn load_schematic(&self, bytes: &[u8]) -> Result<js_sys::Promise, JsError> {
+        self.state.borrow_mut().schematic = Some(Rc::new(Litematic::from_gzip_bytes(bytes)?));
+        Ok(self.rebuild())
     }
 
     /// Show an already decoded schematic, as made by `Litematic::to_preview`
-    /// (e.g. served by a blueprint site). Returns a report once assets are available.
-    pub fn load_preview(&mut self, bytes: &[u8]) -> Result<Option<String>, JsError> {
-        self.schematic = Some(Litematic::from_preview(bytes)?);
-        self.rebuild()
+    /// (e.g. served by a blueprint site).
+    pub fn load_preview(&self, bytes: &[u8]) -> Result<js_sys::Promise, JsError> {
+        self.state.borrow_mut().schematic = Some(Rc::new(Litematic::from_preview(bytes)?));
+        Ok(self.rebuild())
+    }
+
+    /// Called with the fraction done, 0..1, while a model is meshed.
+    pub fn set_progress(&self, callback: Option<js_sys::Function>) {
+        self.state.borrow_mut().progress = callback;
     }
 
     #[wasm_bindgen(getter)]
     pub fn schematic_name(&self) -> Option<String> {
-        self.schematic.as_ref().map(|s| s.metadata.name.clone())
+        self.state.borrow().schematic.as_ref().map(|s| s.metadata.name.clone())
+    }
+
+    /// How many block layers the current model has, 0 if none is shown.
+    #[wasm_bindgen(getter)]
+    pub fn layer_count(&self) -> u32 {
+        self.state.borrow().shown.map_or(0, |([min, max], _)| (max[1] - min[1]).max(0.0) as u32)
+    }
+
+    /// Show the model layer by layer, like a 3D printing slicer: only layers
+    /// `1..=layer` are drawn, counted from the bottom. `undefined` shows all.
+    pub fn set_layer(&self, layer: Option<u32>) {
+        let bottom = self.state.borrow().shown.map_or(0, |([min, _], _)| min[1] as i32);
+        let _ = self.viewer.send_event(UserEvent::SetSlice(layer.map(|n| bottom + n as i32 - 1)));
     }
 
     /// The current model as a binary glTF file.
     pub fn export_glb(&self) -> Result<Vec<u8>, JsError> {
-        let (Some(mesh), Some(lit)) = (&self.mesh, &self.schematic) else {
-            return Err(JsError::new("nothing to export yet"));
-        };
-        Ok(export::glb(mesh, &lit.metadata.name))
+        let (lit, mut assets) = self.exportable()?;
+        let (mesh, _) = Mesher::new(&mut assets, Default::default()).build(&lit);
+        Ok(export::glb(&mesh, &lit.metadata.name))
     }
 
     /// The current model as a binary FBX with the texture embedded. Tints
     /// are baked into the texture because FBX readers ignore vertex colors.
     pub fn export_fbx(&self) -> Result<Vec<u8>, JsError> {
-        let (Some(lit), Some(mut assets)) = (&self.schematic, self.assets()) else {
-            return Err(JsError::new("nothing to export yet"));
-        };
+        let (lit, mut assets) = self.exportable()?;
         let options = mesher::Options { bake_tint: true, ..Default::default() };
-        let (mesh, _) = Mesher::new(&mut assets, options).build(lit);
+        let (mesh, _) = Mesher::new(&mut assets, options).build(&lit);
         let name = &lit.metadata.name;
         // The first file is the .fbx; the texture is embedded in it.
         Ok(export::fbx(&mesh, name, name).swap_remove(0).data)
     }
 
-    /// User packs over the vanilla assets, or `None` if neither is loaded.
-    fn assets(&self) -> Option<Assets> {
-        if self.vanilla.is_none() && self.packs.is_empty() {
-            return None;
+    /// The schematic and assets to export, if it's shown and small enough.
+    fn exportable(&self) -> Result<(Rc<Litematic>, Assets), JsError> {
+        let state = self.state.borrow();
+        let (Some(lit), Some(assets), Some((_, triangles))) = (&state.schematic, state.assets(), state.shown) else {
+            return Err(JsError::new("nothing to export yet"));
+        };
+        if triangles > EXPORT_MAX_TRIANGLES {
+            return Err(JsError::new(&format!(
+                "{triangles} triangles is too large to export in the browser; use the `schematic export` command instead"
+            )));
         }
-        let mut stack = PackStack::new();
-        for pack in &self.packs {
-            stack.push(pack.clone());
-        }
-        if let Some(vanilla) = &self.vanilla {
-            stack.push(vanilla.clone());
-        }
-        Some(Assets::new(stack))
+        Ok((lit.clone(), assets))
     }
 
-    fn rebuild(&mut self) -> Result<Option<String>, JsError> {
-        let (Some(lit), Some(mut assets)) = (&self.schematic, self.assets()) else { return Ok(None) };
-        let (mesh, report) = Mesher::new(&mut assets, Default::default()).build(lit);
-
-        let size = lit.metadata.enclosing_size;
-        let blocks: usize = lit.regions.iter().map(|r| r.iter_blocks().count()).sum();
-        let mut summary = format!(
-            "{} — {}×{}×{}, {blocks} blocks, {} triangles",
-            lit.metadata.name,
-            size.x,
-            size.y,
-            size.z,
-            mesh.triangle_count()
-        );
-        for (name, (reason, count)) in &report.skipped {
-            summary += &format!("\n⚠ {name} ×{count}: {reason}");
-        }
-        for texture in &report.missing_textures {
-            summary += &format!("\n⚠ missing texture {texture}");
-        }
-
-        let _ = self.viewer.send_event(UserEvent::SetMesh(Box::new(mesh.clone())));
-        self.mesh = Some(mesh);
-        Ok(Some(summary))
+    fn rebuild(&self) -> js_sys::Promise {
+        let (state, viewer, shutdown) = (self.state.clone(), self.viewer.clone(), self.shutdown.clone());
+        wasm_bindgen_futures::future_to_promise(async move {
+            match rebuild(state, viewer, shutdown).await {
+                Ok(report) => Ok(report.map_or(JsValue::NULL, JsValue::from)),
+                Err(e) => Err(e.into()),
+            }
+        })
     }
+}
+
+/// Mesh the schematic and send it to the viewer a piece at a time, so only
+/// one piece is ever in memory. Returns the report, or `None` if there is
+/// nothing to show yet or a later rebuild took over.
+async fn rebuild(
+    state: Rc<RefCell<State>>,
+    viewer: EventLoopProxy<UserEvent>,
+    shutdown: Rc<RefCell<Shutdown>>,
+) -> Result<Option<String>, JsError> {
+    let (lit, mut assets, generation) = {
+        let mut s = state.borrow_mut();
+        s.generation += 1;
+        let (Some(lit), Some(assets)) = (s.schematic.clone(), s.assets()) else { return Ok(None) };
+        s.shown = None;
+        (lit, assets, s.generation)
+    };
+    let superseded = || state.borrow().generation != generation || shutdown.borrow().done;
+
+    let options = mesher::Options { slice_caps: true, ..Default::default() };
+    let mut build = Mesher::new(&mut assets, options).prepare(&lit);
+    // Every texture is in the atlas now; the packs' caches can go.
+    drop(assets);
+    let _ = viewer.send_event(UserEvent::BeginMesh(Box::new(build.atlas().clone())));
+
+    let mut triangles = 0;
+    loop {
+        let mut piece = Mesh::default();
+        let more = build.fill(&lit, &mut piece, CHUNK_QUADS);
+        triangles += piece.triangle_count();
+        let piece = Arc::new(piece);
+        let uploaded = Arc::downgrade(&piece);
+        let _ = viewer.send_event(UserEvent::AddMesh(piece));
+        let progress = state.borrow().progress.clone();
+        if let Some(progress) = progress {
+            let _ = progress.call1(&JsValue::NULL, &build.progress().into());
+        }
+        // Let the viewer upload and drop the piece before making the next;
+        // this also keeps the page responsive.
+        loop {
+            next_task().await.map_err(js_error)?;
+            if superseded() {
+                return Ok(None);
+            }
+            if uploaded.strong_count() == 0 {
+                break;
+            }
+        }
+        if !more {
+            break;
+        }
+    }
+
+    let bounds = build.bounds();
+    let (_, report) = build.finish();
+    let _ = viewer.send_event(UserEvent::FinishMesh(bounds));
+    state.borrow_mut().shown = Some((bounds, triangles));
+
+    let size = lit.metadata.enclosing_size;
+    let blocks: usize = lit.regions.iter().map(|r| r.iter_blocks().count()).sum();
+    let mut summary =
+        format!("{} — {}×{}×{}, {blocks} blocks, {triangles} triangles", lit.metadata.name, size.x, size.y, size.z);
+    for (name, (reason, count)) in &report.skipped {
+        summary += &format!("\n⚠ {name} ×{count}: {reason}");
+    }
+    for texture in &report.missing_textures {
+        summary += &format!("\n⚠ missing texture {texture}");
+    }
+    Ok(Some(summary))
 }
 
 /// Freeing the object without `destroy()` still stops the viewer.
 impl Drop for App {
     fn drop(&mut self) {
+        self.state.borrow_mut().generation += 1;
         if !self.shutdown.borrow().done {
             let _ = self.viewer.send_event(UserEvent::Exit);
         }

@@ -3,7 +3,9 @@
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
-use mesher::{Mesh, Transparency};
+use std::ops::Range;
+
+use mesher::{Atlas, Mesh, MeshLayer, Transparency};
 use wgpu::util::DeviceExt;
 
 use crate::camera::OrbitCamera;
@@ -48,14 +50,35 @@ impl Default for Lighting {
     }
 }
 
+/// Packed to 28 bytes: large builds put hundreds of megabytes of these on the GPU.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GpuVertex {
     position: [f32; 3],
-    normal: [f32; 3],
-    uv: [f32; 2],
+    /// xyz: normal; w: 127 for slice caps, see `sliced_away` in shader.wgsl.
+    normal: [i8; 4],
+    /// Atlas UV in 1/65535 steps.
+    uv: [u16; 2],
+    /// rgb: tint; a: ambient occlusion.
     color: [u8; 4],
-    ao: f32,
+    block_y: f32,
+}
+
+const _: () = assert!(size_of::<GpuVertex>() == 28);
+
+impl GpuVertex {
+    fn new(v: &mesher::Vertex, cap: bool) -> Self {
+        let snorm = |c: f32| (c.clamp(-1.0, 1.0) * 127.0).round() as i8;
+        let unorm16 = |c: f32| (c.clamp(0.0, 1.0) * 65535.0).round() as u16;
+        let [r, g, b, _] = v.color;
+        GpuVertex {
+            position: v.position,
+            normal: [snorm(v.normal[0]), snorm(v.normal[1]), snorm(v.normal[2]), if cap { 127 } else { 0 }],
+            uv: [unorm16(v.uv[0]), unorm16(v.uv[1])],
+            color: [r, g, b, (v.ao.clamp(0.0, 1.0) * 255.0).round() as u8],
+            block_y: v.block_y as f32,
+        }
+    }
 }
 
 /// Mirrors `Globals` in shader.wgsl.
@@ -69,6 +92,7 @@ struct Globals {
     sky_bottom: [f32; 4],
     ground: [f32; 4],
     params: [f32; 4],
+    slice: [f32; 4],
 }
 
 struct GpuLayer {
@@ -76,6 +100,32 @@ struct GpuLayer {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     count: u32,
+}
+
+/// Split a layer into runs of whole triangles whose vertex and index buffers
+/// each fit in `max_bytes`, as `(vertices, indices)` ranges. Large builds
+/// exceed the 256 MB a single buffer may hold on the web. Meshes from the
+/// mesher keep each quad's vertices together, so the runs stay compact.
+fn chunks(layer: &MeshLayer, max_bytes: u64) -> Vec<(Range<usize>, Range<usize>)> {
+    let max_vertices = (max_bytes / size_of::<GpuVertex>() as u64).max(3) as usize;
+    let max_indices = (max_bytes / size_of::<u32>() as u64).max(3) as usize;
+    let mut runs = Vec::new();
+    let (mut start, mut min, mut max) = (0, usize::MAX, 0);
+    for (i, triangle) in layer.indices.chunks_exact(3).enumerate() {
+        let (lo, hi) = triangle.iter().fold((min, max), |(lo, hi), &v| (lo.min(v as usize), hi.max(v as usize)));
+        let end = i * 3;
+        if end > start && (hi - lo >= max_vertices || end + 3 - start > max_indices) {
+            runs.push((min..max + 1, start..end));
+            start = end;
+            (min, max) = triangle.iter().fold((usize::MAX, 0), |(lo, hi), &v| (lo.min(v as usize), hi.max(v as usize)));
+        } else {
+            (min, max) = (lo, hi);
+        }
+    }
+    if start < layer.indices.len() {
+        runs.push((min..max + 1, start..layer.indices.len()));
+    }
+    runs
 }
 
 /// Render targets that depend on the output size.
@@ -112,6 +162,8 @@ pub struct Renderer {
     bounds: Option<[Vec3; 2]>,
     /// Sun view-projection and shadow map texel size in world units.
     light: (Mat4, f32),
+    /// Topmost block layer shown, see [`Renderer::set_slice`].
+    slice: Option<i32>,
 }
 
 impl Renderer {
@@ -183,7 +235,7 @@ impl Renderer {
         });
 
         let attributes =
-            wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Unorm8x4, 4 => Float32];
+            wgpu::vertex_attr_array![0 => Float32x3, 1 => Snorm8x4, 2 => Unorm16x2, 3 => Unorm8x4, 4 => Float32];
         let vertex_buffers = [Some(wgpu::VertexBufferLayout {
             array_stride: size_of::<GpuVertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -343,6 +395,7 @@ impl Renderer {
             lighting: Lighting::default(),
             bounds: None,
             light: (Mat4::IDENTITY, 0.0),
+            slice: None,
         }
     }
 
@@ -362,40 +415,40 @@ impl Renderer {
         }
     }
 
+    pub fn slice(&self) -> Option<i32> {
+        self.slice
+    }
+
+    /// Show the build layer by layer, like a 3D printing slicer: blocks
+    /// above world Y `top` are hidden; `None` shows everything. Meshes built
+    /// with [`mesher::Options::slice_caps`] keep the cut layer looking solid.
+    pub fn set_slice(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, top: Option<i32>) {
+        if top != self.slice {
+            self.slice = top;
+            self.update_shadow_map(device, queue);
+        }
+    }
+
     /// Upload a mesh, replacing the previous one.
     pub fn set_mesh(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh: &Mesh) {
-        self.layers.clear();
-        self.bind_group = None;
-        self.bounds = None;
-        let Some(atlas) = &mesh.atlas else { return };
-        if mesh.triangle_count() > 0 {
-            self.bounds = Some([Vec3::from(mesh.bounds[0]), Vec3::from(mesh.bounds[1])]);
-        }
+        let Some(atlas) = &mesh.atlas else {
+            self.layers.clear();
+            self.bind_group = None;
+            self.bounds = None;
+            return;
+        };
+        self.begin_mesh(device, queue, atlas);
+        self.add_mesh(device, mesh);
+        self.finish_mesh(device, queue, mesh.bounds);
+    }
 
-        for (transparency, layer) in mesh.layers() {
-            if layer.is_empty() {
-                continue;
-            }
-            let vertices: Vec<GpuVertex> = layer
-                .vertices
-                .iter()
-                .map(|v| GpuVertex { position: v.position, normal: v.normal, uv: v.uv, color: v.color, ao: v.ao })
-                .collect();
-            self.layers.push(GpuLayer {
-                transparency,
-                vertices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("vertices"),
-                    contents: bytemuck::cast_slice(&vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-                indices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("indices"),
-                    contents: bytemuck::cast_slice(&layer.indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                }),
-                count: layer.indices.len() as u32,
-            });
-        }
+    /// Start replacing the mesh with one that arrives in pieces, for builds
+    /// too large to hold in memory at once (see [`mesher::Build`]). Add the
+    /// pieces with [`Renderer::add_mesh`], then call [`Renderer::finish_mesh`].
+    /// Pieces already added are drawn in the meantime, without shadows.
+    pub fn begin_mesh(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, atlas: &Atlas) {
+        self.layers.clear();
+        self.bounds = None;
 
         let size = wgpu::Extent3d { width: atlas.width, height: atlas.height, depth_or_array_layers: 1 };
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -432,6 +485,42 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
             ],
         }));
+        // Without bounds this only makes sure a (placeholder) shadow map exists.
+        self.update_shadow_map(device, queue);
+    }
+
+    /// Upload the geometry of one piece of the mesh; its `atlas` and
+    /// `bounds` are ignored. The piece can be dropped afterwards.
+    pub fn add_mesh(&mut self, device: &wgpu::Device, mesh: &Mesh) {
+        let max_bytes = device.limits().max_buffer_size;
+        let caps = mesh.caps().map(|(t, layer)| (t, layer, true));
+        for (transparency, layer, cap) in mesh.layers().map(|(t, layer)| (t, layer, false)).into_iter().chain(caps) {
+            for (vertex_range, index_range) in chunks(layer, max_bytes) {
+                let base = vertex_range.start as u32;
+                let vertices: Vec<GpuVertex> = layer.vertices[vertex_range].iter().map(|v| GpuVertex::new(v, cap)).collect();
+                let indices: Vec<u32> = layer.indices[index_range].iter().map(|i| i - base).collect();
+                self.layers.push(GpuLayer {
+                    transparency,
+                    vertices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("vertices"),
+                        contents: bytemuck::cast_slice(&vertices),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    }),
+                    indices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("indices"),
+                        contents: bytemuck::cast_slice(&indices),
+                        usage: wgpu::BufferUsages::INDEX,
+                    }),
+                    count: indices.len() as u32,
+                });
+            }
+        }
+    }
+
+    /// All pieces are in: `bounds` (`[min, max]`) of the whole mesh. Draws
+    /// the shadow map.
+    pub fn finish_mesh(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, bounds: [[f32; 3]; 2]) {
+        self.bounds = (!self.layers.is_empty()).then(|| [Vec3::from(bounds[0]), Vec3::from(bounds[1])]);
         self.update_shadow_map(device, queue);
     }
 
@@ -543,6 +632,7 @@ impl Renderer {
             sky_bottom: linear(l.sky_bottom),
             ground,
             params: [l.ambient_occlusion, l.shadow_strength, self.light.1, 1.0 / shadow_size],
+            slice: [self.slice.map_or(f32::MAX, |y| y as f32), 0.0, 0.0, 0.0],
         }
     }
 
@@ -629,5 +719,31 @@ impl Renderer {
         for layer in self.layers.iter().filter(|l| l.transparency == Transparency::Translucent) {
             draw(&mut pass, layer);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mesher::Vertex;
+
+    fn quads(n: u32) -> MeshLayer {
+        let v = Vertex { position: [0.0; 3], normal: [0.0; 3], uv: [0.0; 2], color: [255; 4], ao: 1.0, block_y: 0 };
+        let indices = (0..n).flat_map(|q| [0, 1, 2, 0, 2, 3].map(|i| q * 4 + i)).collect();
+        MeshLayer { vertices: vec![v; n as usize * 4], indices }
+    }
+
+    #[test]
+    fn small_layers_are_one_chunk() {
+        assert_eq!(chunks(&quads(10), 1 << 28), [(0..40, 0..60)]);
+        assert!(chunks(&MeshLayer::default(), 1 << 28).is_empty());
+    }
+
+    #[test]
+    fn large_layers_split_between_quads_within_the_limit() {
+        // Room for 10 vertices: two quads per chunk.
+        let max_bytes = 10 * size_of::<GpuVertex>() as u64;
+        let runs = chunks(&quads(5), max_bytes);
+        assert_eq!(runs, [(0..8, 0..12), (8..16, 12..24), (16..20, 24..30)]);
     }
 }

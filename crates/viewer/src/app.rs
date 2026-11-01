@@ -1,10 +1,13 @@
 //! Interactive window: left drag orbits, right/middle drag (or shift + left)
-//! pans, scroll zooms, `R` re-frames the model.
+//! pans, scroll zooms, `R` re-frames the model. Page Down / Page Up (or `[`
+//! and `]`) step through the build layer by layer, top down; `Esc` shows
+//! every layer again. On the web the page drives the layer view instead,
+//! through [`UserEvent::SetSlice`], so it can keep its own controls in sync.
 
 use std::sync::Arc;
 
 use glam::Vec3;
-use mesher::Mesh;
+use mesher::{Atlas, Mesh};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -18,8 +21,20 @@ use crate::{OrbitCamera, Renderer};
 pub enum UserEvent {
     /// GPU setup finished (it is asynchronous on the web).
     GpuReady(Box<Gpu>),
-    /// Show a different model.
-    SetMesh(Box<Mesh>),
+    /// Show a different model. Shared, so the sender can keep it (e.g. for
+    /// exporting) without a copy; the viewer drops it once uploaded.
+    SetMesh(Arc<Mesh>),
+    /// Start showing a model that arrives in pieces, for builds too large
+    /// to hold in memory at once; see [`Renderer::begin_mesh`].
+    BeginMesh(Box<Atlas>),
+    /// One piece of the model; dropped once uploaded, so the sender can
+    /// wait for that before making the next.
+    AddMesh(Arc<Mesh>),
+    /// All pieces sent: bounds of the whole model, `[min, max]`.
+    FinishMesh([[f32; 3]; 2]),
+    /// Hide blocks above this world Y; `None` shows them all.
+    /// See [`Renderer::set_slice`].
+    SetSlice(Option<i32>),
     /// Stop the event loop and release the window and GPU. On the web this
     /// lets a new viewer be spawned afterwards.
     Exit,
@@ -157,8 +172,8 @@ pub struct Viewer {
     #[cfg(target_arch = "wasm32")]
     canvas: web_sys::HtmlCanvasElement,
     gpu: Option<Gpu>,
-    /// Waiting for the GPU to be ready.
-    pending: Option<Mesh>,
+    /// Events that need the GPU, received before it was ready.
+    pending: Vec<UserEvent>,
     bounds: Option<[[f32; 3]; 2]>,
     camera: OrbitCamera,
     drag: Drag,
@@ -176,16 +191,69 @@ impl Drop for Viewer {
 }
 
 impl Viewer {
-    fn show(&mut self, mesh: Mesh) {
+    /// Handle an event that needs the GPU.
+    fn render_event(&mut self, event: UserEvent) {
         let Some(gpu) = &mut self.gpu else {
-            self.pending = Some(mesh);
+            self.pending.push(event);
             return;
         };
+        let (device, queue) = (&gpu.device, &gpu.queue);
         // Only the bounds are kept; the GPU holds the geometry.
-        self.bounds = Some(mesh.bounds);
-        self.camera.frame(Vec3::from(mesh.bounds[0]), Vec3::from(mesh.bounds[1]));
-        gpu.renderer.set_mesh(&gpu.device, &gpu.queue, &mesh);
+        let bounds = match event {
+            UserEvent::SetMesh(mesh) => {
+                gpu.renderer.set_mesh(device, queue, &mesh);
+                Some(mesh.bounds)
+            }
+            UserEvent::BeginMesh(atlas) => {
+                gpu.renderer.begin_mesh(device, queue, &atlas);
+                self.bounds = None;
+                None
+            }
+            UserEvent::AddMesh(mesh) => {
+                gpu.renderer.add_mesh(device, &mesh);
+                None
+            }
+            UserEvent::FinishMesh(bounds) => {
+                gpu.renderer.finish_mesh(device, queue, bounds);
+                Some(bounds)
+            }
+            UserEvent::SetSlice(top) => {
+                gpu.renderer.set_slice(device, queue, top);
+                None
+            }
+            UserEvent::GpuReady(_) | UserEvent::Exit => unreachable!("not a render event"),
+        };
+        if let Some([min, max]) = bounds {
+            self.bounds = Some([min, max]);
+            self.camera.frame(Vec3::from(min), Vec3::from(max));
+        }
         gpu.window.request_redraw();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn set_slice(&mut self, top: Option<i32>) {
+        self.render_event(UserEvent::SetSlice(top));
+    }
+
+    /// Move the layer view `steps` layers up (negative: down), or show every
+    /// layer with `None`. Going above the top layer also shows them all.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn step_slice(&mut self, steps: Option<i32>) {
+        let (Some([min, max]), Some(gpu)) = (self.bounds, &self.gpu) else { return };
+        let (bottom, top) = (min[1].floor() as i32, max[1].ceil() as i32 - 1);
+        let next = match (gpu.renderer.slice(), steps) {
+            (_, None) => None,
+            (None, Some(steps)) if steps < 0 => Some(top + 1 + steps),
+            (None, Some(_)) => None,
+            (Some(y), Some(steps)) => Some(y + steps),
+        };
+        let next = next.filter(|&y| y <= top).map(|y| y.max(bottom));
+        if let Some(y) = next {
+            gpu.window.set_title(&format!("{} - layer {}/{}", self.title, y - bottom + 1, top - bottom + 1));
+        } else {
+            gpu.window.set_title(&self.title);
+        }
+        self.set_slice(next);
     }
 
     fn redraw(&self) {
@@ -229,12 +297,12 @@ impl ApplicationHandler<UserEvent> for Viewer {
         match event {
             UserEvent::GpuReady(gpu) => {
                 self.gpu = Some(*gpu);
-                if let Some(mesh) = self.pending.take() {
-                    self.show(mesh);
+                for event in std::mem::take(&mut self.pending) {
+                    self.render_event(event);
                 }
             }
-            UserEvent::SetMesh(mesh) => self.show(*mesh),
             UserEvent::Exit => event_loop.exit(),
+            event => self.render_event(event),
         }
     }
 
@@ -291,6 +359,13 @@ impl ApplicationHandler<UserEvent> for Viewer {
                     self.camera.frame(Vec3::from(min), Vec3::from(max));
                     self.redraw();
                 }
+                #[cfg(not(target_arch = "wasm32"))]
+                match event.logical_key.as_ref() {
+                    Key::Named(NamedKey::PageDown) | Key::Character("[") => self.step_slice(Some(-1)),
+                    Key::Named(NamedKey::PageUp) | Key::Character("]") => self.step_slice(Some(1)),
+                    Key::Named(NamedKey::Escape) => self.step_slice(None),
+                    _ => {}
+                }
             }
             _ => {}
         }
@@ -305,7 +380,7 @@ impl Viewer {
             #[cfg(target_arch = "wasm32")]
             canvas,
             gpu: None,
-            pending: None,
+            pending: Vec::new(),
             bounds: None,
             camera: OrbitCamera::default(),
             drag: Drag::default(),
@@ -322,7 +397,7 @@ pub fn run(mesh: Mesh, title: &str) -> Result<(), winit::error::EventLoopError> 
     // Only redraw in response to input, so an idle viewer uses no GPU time.
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut viewer = Viewer::new(event_loop.create_proxy(), title);
-    viewer.pending = Some(mesh);
+    viewer.pending.push(UserEvent::SetMesh(Arc::new(mesh)));
     event_loop.run_app(&mut viewer)
 }
 

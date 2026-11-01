@@ -37,6 +37,19 @@ pub async fn render_with_lighting(
     height: u32,
     lighting: &Lighting,
 ) -> Result<Vec<u8>, Error> {
+    render_sliced(mesh, camera, width, height, lighting, None).await
+}
+
+/// Like [`render_with_lighting`], showing only the blocks up to world Y
+/// `slice`, see [`Renderer::set_slice`].
+pub async fn render_sliced(
+    mesh: &Mesh,
+    camera: &OrbitCamera,
+    width: u32,
+    height: u32,
+    lighting: &Lighting,
+    slice: Option<i32>,
+) -> Result<Vec<u8>, Error> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions::default())
@@ -46,8 +59,9 @@ pub async fn render_with_lighting(
 
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let mut renderer = Renderer::new(&device, format);
-    // Set lighting before the mesh so the shadow map is only drawn once.
+    // Set lighting and slice before the mesh so the shadow map is only drawn once.
     renderer.set_lighting(&device, &queue, lighting.clone());
+    renderer.set_slice(&device, &queue, slice);
     renderer.set_mesh(&device, &queue, mesh);
 
     let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };

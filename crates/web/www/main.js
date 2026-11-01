@@ -1,5 +1,9 @@
 import init, { App, load_vanilla, minecraft_versions } from "./pkg/web.js";
 
+// Rust panics are reported with a JS stack; the default 10 frames stop
+// before the frame that caused them.
+Error.stackTraceLimit = 64;
+
 const $ = (id) => document.getElementById(id);
 const ui = {
   canvas: $("view"),
@@ -12,6 +16,8 @@ const ui = {
   packs: $("packs"),
   exportGlb: $("export"),
   exportFbx: $("export-fbx"),
+  layer: $("layer"),
+  layerLabel: $("layer-label"),
   status: $("status"),
   report: $("report"),
 };
@@ -33,6 +39,28 @@ function showReport(report) {
   );
   ui.exportGlb.disabled = false;
   ui.exportFbx.disabled = false;
+  // A different model starts fully shown; a re-mesh of the same one keeps its layer.
+  const count = app.layer_count;
+  if (count !== Number(ui.layer.max)) {
+    ui.layer.max = count;
+    ui.layer.value = count;
+  }
+  ui.layer.disabled = count === 0;
+  showLayer();
+}
+
+// The top layer shows everything, so it needs no cut.
+function showLayer() {
+  const layer = Number(ui.layer.value);
+  const count = Number(ui.layer.max);
+  app.set_layer(layer < count ? layer : undefined);
+  ui.layerLabel.textContent = layer < count ? `${layer} / ${count}` : `all ${count}`;
+}
+
+function stepLayer(steps) {
+  if (ui.layer.disabled) return;
+  ui.layer.value = Number(ui.layer.value) + steps;
+  showLayer();
 }
 
 function download(bytes, extension, type) {
@@ -55,6 +83,14 @@ async function attempt(action) {
 await init();
 const app = new App(ui.canvas);
 const packNames = [];
+let haveVanilla = false;
+
+// Large builds are meshed and shown piece by piece.
+app.set_progress((fraction) => {
+  ui.report.textContent = `Building the model… ${Math.round(fraction * 100)}%`;
+  ui.exportGlb.disabled = true;
+  ui.exportFbx.disabled = true;
+});
 
 // Only the latest request for vanilla assets wins if the user switches fast.
 let versionRequest = 0;
@@ -70,6 +106,7 @@ async function loadVersion(version) {
     status(
       `Minecraft ${assets.version}: ${assets.files} block assets (${(assets.downloaded / 1e6).toFixed(1)} MB, cached for next time)`,
     );
+    haveVanilla = true;
     return app.set_vanilla(assets);
   });
   ui.version.disabled = false;
@@ -81,7 +118,7 @@ async function openFiles(files) {
     if (/\.litematic$/i.test(file.name)) {
       await attempt(() => {
         const report = app.load_schematic(bytes);
-        if (report == null)
+        if (!haveVanilla && packNames.length === 0)
           status("Schematic loaded; waiting for block assets…");
         return report;
       });
@@ -116,6 +153,16 @@ ui.clearPacks.addEventListener("click", () =>
   }),
 );
 ui.version.addEventListener("change", () => loadVersion(ui.version.value));
+ui.layer.addEventListener("input", showLayer);
+ui.canvas.addEventListener("keydown", (e) => {
+  const steps = { PageUp: 1, "]": 1, PageDown: -1, "[": -1 }[e.key];
+  if (steps) {
+    e.preventDefault();
+    stepLayer(steps);
+  } else if (e.key === "Escape") {
+    stepLayer(Number(ui.layer.max));
+  }
+});
 
 ui.exportGlb.addEventListener("click", () =>
   attempt(() => (download(app.export_glb(), "glb", "model/gltf-binary"), null)),

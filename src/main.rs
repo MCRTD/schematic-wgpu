@@ -77,6 +77,9 @@ enum Command {
         /// Don't draw the ground under the build
         #[arg(long)]
         no_ground: bool,
+        /// Only show blocks up to this layer, counted from 1 at the bottom
+        #[arg(long)]
+        layer: Option<i32>,
     },
 }
 
@@ -149,14 +152,15 @@ fn main() -> anyhow::Result<()> {
         Command::View { litematic, packs } => {
             let lit = open(&litematic)?;
             let mut assets = load_packs(&packs)?;
-            let (mesh, report) = mesher::Mesher::new(&mut assets, Default::default()).build(&lit);
+            let options = mesher::Options { slice_caps: true, ..Default::default() };
+            let (mesh, report) = mesher::Mesher::new(&mut assets, options).build(&lit);
             print_report(&report);
             let name = if lit.metadata.name.is_empty() { "schematic" } else { &lit.metadata.name };
             viewer::app::run(mesh, &format!("{name} - schematic viewer"))?;
         }
-        Command::Render { litematic, packs, output, width, height, yaw, pitch, zoom, no_shadows, no_ground } => {
+        Command::Render { litematic, packs, output, width, height, yaw, pitch, zoom, no_shadows, no_ground, layer } => {
             let lighting = viewer::Lighting { shadows: !no_shadows, ground: !no_ground, ..Default::default() };
-            render(litematic, packs, output, (width, height), (yaw, pitch, zoom), &lighting)?;
+            render(litematic, packs, output, (width, height), (yaw, pitch, zoom), &lighting, layer)?;
         }
     }
     Ok(())
@@ -169,10 +173,12 @@ fn render(
     (width, height): (u32, u32),
     (yaw, pitch, zoom): (f32, f32, f32),
     lighting: &viewer::Lighting,
+    layer: Option<i32>,
 ) -> anyhow::Result<()> {
     let lit = open(&litematic)?;
     let mut assets = load_packs(&packs)?;
-    let (mesh, report) = mesher::Mesher::new(&mut assets, Default::default()).build(&lit);
+    let options = mesher::Options { slice_caps: layer.is_some(), ..Default::default() };
+    let (mesh, report) = mesher::Mesher::new(&mut assets, options).build(&lit);
     print_report(&report);
 
     let mut camera = viewer::OrbitCamera {
@@ -183,7 +189,9 @@ fn render(
     camera.frame(glam::Vec3::from(mesh.bounds[0]), glam::Vec3::from(mesh.bounds[1]));
     camera.distance /= zoom;
 
-    let pixels = pollster::block_on(viewer::headless::render_with_lighting(&mesh, &camera, width, height, lighting))?;
+    // Layer 1 is the bottom of the build, wherever it sits in the world.
+    let slice = layer.map(|n| mesh.bounds[0][1] as i32 + n - 1);
+    let pixels = pollster::block_on(viewer::headless::render_sliced(&mesh, &camera, width, height, lighting, slice))?;
     let output = output.unwrap_or_else(|| litematic.with_extension("png"));
     image::RgbaImage::from_raw(width, height, pixels)
         .context("rendered image has the wrong size")?

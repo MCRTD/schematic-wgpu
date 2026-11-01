@@ -11,6 +11,8 @@ struct Globals {
     // x: ambient occlusion strength, y: shadow strength,
     // z: shadow map texel size in world units, w: texel size in UV.
     params: vec4<f32>,
+    // x: world Y of the topmost block layer shown; everything above is cut away.
+    slice: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -24,10 +26,13 @@ const SHADOW_TINT: vec3<f32> = vec3<f32>(0.46, 0.52, 0.64);
 
 struct VertexIn {
     @location(0) position: vec3<f32>,
-    @location(1) normal: vec3<f32>,
+    // xyz: normal; w: 1 for slice caps.
+    @location(1) normal: vec4<f32>,
     @location(2) uv: vec2<f32>,
+    // rgb: tint; a: ambient occlusion.
     @location(3) color: vec4<f32>,
-    @location(4) ao: f32,
+    // World Y of the block the vertex belongs to.
+    @location(4) block_y: f32,
 };
 
 struct VertexOut {
@@ -85,6 +90,15 @@ fn light(sun: f32) -> vec3<f32> {
     return mix(shadow, vec3<f32>(1.0), sun);
 }
 
+// Whether a vertex is hidden by the layer view. Slice caps, the tops of blocks
+// covered by the block above, only show on the topmost layer.
+fn sliced_away(in: VertexIn) -> bool {
+    return in.block_y > globals.slice.x || (in.normal.w > 0.5 && in.block_y != globals.slice.x);
+}
+
+// Outside the clip volume, so triangles made of these vertices are dropped.
+const CULLED: vec4<f32> = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+
 fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
     return pow(c, vec3<f32>(2.2));
 }
@@ -93,13 +107,16 @@ fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
 fn vs_main(in: VertexIn) -> VertexOut {
     var out: VertexOut;
     out.clip = globals.view_proj * vec4<f32>(in.position, 1.0);
+    if sliced_away(in) {
+        out.clip = CULLED;
+    }
     out.uv = in.uv;
     out.world = in.position;
-    out.normal = normalize(in.normal);
+    out.normal = normalize(in.normal.xyz);
     // Minecraft multiplies tint, shade and ambient occlusion in sRGB space.
     // Because (a * b)^2.2 == a^2.2 * b^2.2, converting to linear here gives
     // the same result once the sRGB target encodes the output again.
-    let ao = mix(1.0, in.ao, globals.params.x);
+    let ao = mix(1.0, in.color.a, globals.params.x);
     out.tint = srgb_to_linear(in.color.rgb * shade(out.normal) * ao);
     return out;
 }
@@ -139,6 +156,9 @@ struct ShadowOut {
 fn vs_shadow(in: VertexIn) -> ShadowOut {
     var out: ShadowOut;
     out.clip = globals.light_view_proj * vec4<f32>(in.position, 1.0);
+    if sliced_away(in) {
+        out.clip = CULLED;
+    }
     out.uv = in.uv;
     return out;
 }

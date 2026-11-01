@@ -40,6 +40,8 @@
     #report { margin-top: 8px; font-size: 12px; white-space: pre-wrap; }
     #report .warn { color: var(--warn); }
     #packs { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    #layer { width: 100%; accent-color: var(--accent); }
+    #layer-label { float: right; color: var(--text); font-variant-numeric: tabular-nums; }
     .hint, .legal { font-size: 11px; color: var(--muted); margin-top: 12px; }
     #drag-veil { position: fixed; inset: 0; border: 3px dashed var(--accent); pointer-events: none; display: none; }
     body.dragging #drag-veil { display: block; }
@@ -66,6 +68,9 @@
     <input id="pack-file" type="file" accept=".zip,.jar" multiple hidden>
     <div id="packs"></div>
 
+    <label for="layer">Layers <span id="layer-label"></span></label>
+    <input id="layer" type="range" min="1" max="1" value="1" disabled>
+
     <label>Export</label>
     <div class="row">
       <button id="export" class="primary" disabled>Download .glb</button>
@@ -75,7 +80,7 @@
     <div id="status"></div>
     <div id="report"></div>
 
-    <div class="hint">Drag to orbit · right-drag or shift-drag to pan · scroll to zoom · R to re-frame</div>
+    <div class="hint">Drag to orbit · right-drag or shift-drag to pan · scroll to zoom · R to re-frame · Page Up/Down or [ ] to step through layers</div>
     <div class="legal">Block assets are downloaded directly from Mojang's servers into your browser. Not an official Minecraft product; not affiliated with Mojang or Microsoft.</div>
   </div>
 

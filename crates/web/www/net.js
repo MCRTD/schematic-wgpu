@@ -35,3 +35,7 @@ export async function fetch_text(url, useCache) {
   const response = useCache ? await cached(url, load) : await load();
   return response.text();
 }
+
+export function next_task() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}

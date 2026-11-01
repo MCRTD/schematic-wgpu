@@ -27,6 +27,10 @@ pub struct Vertex {
     /// Ambient occlusion brightness from neighbouring blocks, 0..1 (1 = unoccluded).
     /// Kept apart from `color` so renderers and exporters can choose to use it.
     pub ao: f32,
+    /// World Y of the block this vertex belongs to, for showing the build
+    /// layer by layer. Parts of a model that stick out of its block still
+    /// count as that block's layer.
+    pub block_y: i32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -64,6 +68,11 @@ pub struct Mesh {
     pub atlas: Option<Atlas>,
     /// World-space bounds of all blocks, `[min, max]`.
     pub bounds: [[f32; 3]; 2],
+    /// With [`Options::slice_caps`]: top faces hidden only by the block
+    /// above, indexed by `Transparency as usize`. A layer view draws them on
+    /// the topmost visible layer so cut blocks look solid. Not part of
+    /// [`Mesh::layers`], so exporters leave them out.
+    pub caps: [MeshLayer; 3],
 }
 
 impl Mesh {
@@ -81,6 +90,15 @@ impl Mesh {
             Transparency::Cutout => &mut self.cutout,
             Transparency::Translucent => &mut self.translucent,
         }
+    }
+
+    /// Like [`Mesh::layers`], for [`Mesh::caps`].
+    pub fn caps(&self) -> [(Transparency, &MeshLayer); 3] {
+        [
+            (Transparency::Opaque, &self.caps[Transparency::Opaque as usize]),
+            (Transparency::Cutout, &self.caps[Transparency::Cutout as usize]),
+            (Transparency::Translucent, &self.caps[Transparency::Translucent as usize]),
+        ]
     }
 
     pub fn triangle_count(&self) -> usize {
@@ -107,22 +125,27 @@ pub struct Options {
     pub bake_tint: bool,
     /// Compute [`Vertex::ao`] from neighbouring blocks; otherwise it is always 1.
     pub ambient_occlusion: bool,
+    /// Fill [`Mesh::caps`], for viewers that show the build layer by layer.
+    pub slice_caps: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { placeholder_for_missing: true, bake_tint: false, ambient_occlusion: true }
+        Self { placeholder_for_missing: true, bake_tint: false, ambient_occlusion: true, slice_caps: false }
     }
 }
 
 /// Brightness for 0..=3 unoccluded neighbours around a vertex.
 const AO_LEVELS: [f32; 4] = [0.45, 0.62, 0.8, 1.0];
 
+/// The quads of one weighted variant, each with its atlas sprite.
+type Choice = (u32, Vec<(Quad, u32)>);
+
 /// A palette entry baked into quads. Weighted variants have one quad list
 /// per choice; `parts` are always all drawn.
 #[derive(Debug, Default)]
 struct BakedState {
-    parts: Vec<Vec<(u32, Vec<Quad>)>>,
+    parts: Vec<Vec<Choice>>,
     /// Whether the block completely hides the face of a neighbour touching
     /// each side, indexed by `Direction as usize`.
     opaque_sides: [bool; 6],
@@ -164,75 +187,33 @@ impl<'a> Mesher<'a> {
         }
     }
 
-    pub fn build(mut self, schematic: &Litematic) -> (Mesh, Report) {
+    pub fn build(self, schematic: &Litematic) -> (Mesh, Report) {
+        let mut build = self.prepare(schematic);
         let mut mesh = Mesh::default();
-        let mut bounds = [Vec3::MAX, Vec3::MIN];
-        // Sprite index per face, resolved into atlas UVs once all sprites are known.
-        let mut pending: Vec<(Transparency, [Vertex; 4], u32)> = Vec::new();
-
-        for region in &schematic.regions {
-            let baked: Vec<BakedState> = region.palette.iter().map(|s| self.bake_state(s)).collect();
-            let origin = Vec3::new(region.origin.x as f32, region.origin.y as f32, region.origin.z as f32);
-
-            for (pos, _) in region.iter_blocks() {
-                let index = region.blocks[region.index(pos.x, pos.y, pos.z)] as usize;
-                let state = &baked[index];
-                if state.reported {
-                    let name = &region.palette[index].name;
-                    if let Some(entry) = self.report.skipped.get_mut(name) {
-                        entry.1 += 1;
-                    }
-                }
-                if state.skip {
-                    continue;
-                }
-                let block_pos = origin + Vec3::new(pos.x as f32, pos.y as f32, pos.z as f32);
-                bounds = [bounds[0].min(block_pos), bounds[1].max(block_pos + Vec3::ONE)];
-
-                for part in &state.parts {
-                    let Some(quads) = pick_weighted(part, pos) else { continue };
-                    for quad in quads {
-                        if let Some(dir) = quad.cullface
-                            && is_hidden(region, &baked, pos, index, dir)
-                        {
-                            continue;
-                        }
-                        let tint = quad.tinted.then_some(state.tint);
-                        let (sprite, [r, g, b]) = match tint {
-                            Some(tint) if self.options.bake_tint => (self.tinted_sprite(quad.texture.clone(), tint), [255; 3]),
-                            _ => (self.sprite(quad.texture.clone()), tint.unwrap_or([255; 3])),
-                        };
-                        let transparency = self.sprites[sprite as usize].transparency;
-                        let ao = if self.options.ambient_occlusion && quad.ambient_occlusion {
-                            vertex_ao(region, &baked, pos, quad)
-                        } else {
-                            [1.0; 4]
-                        };
-                        let corners = std::array::from_fn(|i| Vertex {
-                            position: (block_pos + quad.positions[i]).into(),
-                            normal: quad.normal.into(),
-                            uv: quad.uvs[i],
-                            color: [r, g, b, 255],
-                            ao: ao[i],
-                        });
-                        pending.push((transparency, corners, sprite));
-                    }
-                }
-            }
-        }
-
-        let atlas = Atlas::pack(&self.sprites);
-        for (transparency, mut corners, sprite) in pending {
-            let rect = atlas.rects[sprite as usize];
-            for v in &mut corners {
-                v.uv = rect.map(v.uv);
-            }
-            mesh.layer_mut(transparency).push_quad(corners);
-        }
+        build.fill(schematic, &mut mesh, usize::MAX);
+        let (atlas, report) = build.finish();
         mesh.atlas = Some(atlas);
-        mesh.bounds = if bounds[0].x <= bounds[1].x { [bounds[0].into(), bounds[1].into()] } else { [[0.0; 3]; 2] };
-        self.report.missing_textures.sort();
-        (mesh, self.report)
+        (mesh, report)
+    }
+
+    /// Resolve every block state and texture of `schematic` and pack the
+    /// atlas, so the blocks can then be meshed a piece at a time with
+    /// [`Build::fill`]. That keeps memory bounded for builds too large to
+    /// hold as one [`Mesh`].
+    pub fn prepare(mut self, schematic: &Litematic) -> Build {
+        let baked = schematic.regions.iter().map(|r| r.palette.iter().map(|s| self.bake_state(s)).collect()).collect();
+        Build {
+            atlas: Atlas::pack(&self.sprites),
+            transparency: self.sprites.iter().map(|s| s.transparency).collect(),
+            options: self.options,
+            baked,
+            report: self.report,
+            bounds: [Vec3::MAX, Vec3::MIN],
+            region: 0,
+            next: 0,
+            done: 0,
+            total: schematic.regions.iter().map(|r| r.blocks.len()).sum(),
+        }
     }
 
     /// Atlas sprite index for a texture; missing textures share one sprite.
@@ -297,7 +278,7 @@ impl<'a> Mesher<'a> {
         }
         let name = state.short_name();
         let mut reported = false;
-        let parts: Vec<Vec<(u32, Vec<Quad>)>> = if LIQUIDS.contains(&name) {
+        let quads: Vec<Vec<(u32, Vec<Quad>)>> = if LIQUIDS.contains(&name) {
             vec![vec![(1, liquid_quads(name, &state.properties))]]
         } else {
             match self.assets.resolve(&state.name, &state.properties) {
@@ -317,7 +298,7 @@ impl<'a> Mesher<'a> {
             }
         };
 
-        if parts.iter().flatten().all(|(_, quads)| quads.is_empty()) {
+        if quads.iter().flatten().all(|(_, quads)| quads.is_empty()) {
             reported = true;
             self.report_skip(state, "no model geometry (drawn by a block entity renderer)".into());
         }
@@ -326,8 +307,8 @@ impl<'a> Mesher<'a> {
         // variants of one block share their shape.
         let mut opaque_sides = [false; 6];
         let mut full_sides = [false; 6];
-        for quads in parts.iter().filter_map(|p| p.first()).map(|(_, q)| q) {
-            for quad in quads {
+        for first in quads.iter().filter_map(|p| p.first()).map(|(_, q)| q) {
+            for quad in first {
                 let Some(dir) = quad.cullface else { continue };
                 if !quad.covers_face(dir) {
                     continue;
@@ -340,12 +321,25 @@ impl<'a> Mesher<'a> {
             }
         }
         let fluid = LIQUIDS.into_iter().find(|&l| l == name);
+        let tint = tint::color(name, &state.properties);
+        let mut with_sprite = |quad: Quad| {
+            let sprite = if quad.tinted && self.options.bake_tint {
+                self.tinted_sprite(quad.texture.clone(), tint)
+            } else {
+                self.sprite(quad.texture.clone())
+            };
+            (quad, sprite)
+        };
+        let parts = quads
+            .into_iter()
+            .map(|choices| choices.into_iter().map(|(w, quads)| (w, quads.into_iter().map(&mut with_sprite).collect())).collect())
+            .collect();
         BakedState {
             parts,
             opaque_sides,
             full_sides,
             occludes: fluid.is_none() && opaque_sides.iter().all(|&o| o),
-            tint: tint::color(name, &state.properties),
+            tint,
             fluid,
             reported,
             skip: false,
@@ -353,8 +347,124 @@ impl<'a> Mesher<'a> {
     }
 }
 
+/// A schematic being meshed piece by piece, from [`Mesher::prepare`].
+pub struct Build {
+    atlas: Atlas,
+    /// By sprite index.
+    transparency: Vec<Transparency>,
+    options: Options,
+    /// By region, then palette index.
+    baked: Vec<Vec<BakedState>>,
+    report: Report,
+    bounds: [Vec3; 2],
+    /// Next block to mesh: region and index into its blocks.
+    region: usize,
+    next: usize,
+    /// Blocks visited so far, and in all regions.
+    done: usize,
+    total: usize,
+}
+
+impl Build {
+    /// The texture atlas every piece of the mesh uses.
+    pub fn atlas(&self) -> &Atlas {
+        &self.atlas
+    }
+
+    /// Mesh blocks into `mesh` until it gained at least `max_quads` quads
+    /// (counting [`Mesh::caps`]) or all blocks are done; returns whether
+    /// blocks remain. `schematic` must be the one given to [`Mesher::prepare`].
+    /// `mesh.bounds` is set to the bounds of all blocks meshed so far, and
+    /// `mesh.atlas` is left alone.
+    pub fn fill(&mut self, schematic: &Litematic, mesh: &mut Mesh, max_quads: usize) -> bool {
+        let mut added = 0;
+        while let Some(region) = schematic.regions.get(self.region) {
+            let baked = &self.baked[self.region];
+            let origin = Vec3::new(region.origin.x as f32, region.origin.y as f32, region.origin.z as f32);
+            while self.next < region.blocks.len() && added < max_quads {
+                let i = self.next;
+                self.next += 1;
+                self.done += 1;
+                let index = region.blocks[i] as usize;
+                let state = &baked[index];
+                if state.reported {
+                    let name = &region.palette[index].name;
+                    if let Some(entry) = self.report.skipped.get_mut(name) {
+                        entry.1 += 1;
+                    }
+                }
+                if state.skip {
+                    continue;
+                }
+                let pos = region.position(i);
+                let block_pos = origin + Vec3::new(pos.x as f32, pos.y as f32, pos.z as f32);
+                self.bounds = [self.bounds[0].min(block_pos), self.bounds[1].max(block_pos + Vec3::ONE)];
+
+                for part in &state.parts {
+                    let Some(quads) = pick_weighted(part, pos) else { continue };
+                    for (quad, sprite) in quads {
+                        let mut cap = false;
+                        if let Some(dir) = quad.cullface
+                            && is_hidden(region, baked, pos, index, dir)
+                        {
+                            if dir != Direction::Up || !self.options.slice_caps {
+                                continue;
+                            }
+                            cap = true;
+                        }
+                        // Baked tints are already in the sprite.
+                        let [r, g, b] = if quad.tinted && !self.options.bake_tint { state.tint } else { [255; 3] };
+                        let transparency = self.transparency[*sprite as usize];
+                        let rect = self.atlas.rects[*sprite as usize];
+                        // A cap is seen with everything above it cut away.
+                        let ao = if self.options.ambient_occlusion && quad.ambient_occlusion && !cap {
+                            vertex_ao(region, baked, pos, quad)
+                        } else {
+                            [1.0; 4]
+                        };
+                        let corners = std::array::from_fn(|i| Vertex {
+                            position: (block_pos + quad.positions[i]).into(),
+                            normal: quad.normal.into(),
+                            uv: rect.map(quad.uvs[i]),
+                            color: [r, g, b, 255],
+                            ao: ao[i],
+                            block_y: region.origin.y + pos.y,
+                        });
+                        let layer = if cap { &mut mesh.caps[transparency as usize] } else { mesh.layer_mut(transparency) };
+                        layer.push_quad(corners);
+                        added += 1;
+                    }
+                }
+            }
+            if self.next < region.blocks.len() {
+                break;
+            }
+            self.region += 1;
+            self.next = 0;
+        }
+        mesh.bounds = self.bounds();
+        self.region < schematic.regions.len()
+    }
+
+    /// Fraction of the blocks meshed so far, 0..=1.
+    pub fn progress(&self) -> f32 {
+        if self.total == 0 { 1.0 } else { self.done as f32 / self.total as f32 }
+    }
+
+    /// World-space bounds of the blocks meshed so far, `[min, max]`.
+    pub fn bounds(&self) -> [[f32; 3]; 2] {
+        let [min, max] = self.bounds;
+        if min.x <= max.x { [min.into(), max.into()] } else { [[0.0; 3]; 2] }
+    }
+
+    pub fn finish(mut self) -> (Atlas, Report) {
+        self.report.missing_textures.sort();
+        (self.atlas, self.report)
+    }
+}
+
 /// Deterministically choose a weighted variant based on block position.
-fn pick_weighted(choices: &[(u32, Vec<Quad>)], pos: Vec3i) -> Option<&Vec<Quad>> {
+fn pick_weighted<T>(choices: &[(u32, Vec<T>)], pos: Vec3i) -> Option<&Vec<T>> {
     let total: u32 = choices.iter().map(|(w, _)| *w).sum();
     if choices.len() <= 1 || total == 0 {
         return choices.first().map(|(_, q)| q);
@@ -582,6 +692,50 @@ mod tests {
         // up visible, north visible = 2. Top stone: all 6 (slab top doesn't
         // cull and has no cullface).
         assert_eq!(mesh.opaque.indices.len() / 6, 5 + 2 + 6);
+    }
+
+    #[test]
+    fn slice_caps_keep_tops_hidden_by_the_block_above() {
+        let lit = schematic(Vec3i { x: 1, y: 2, z: 1 }, vec![state("stone", &[])], vec![0, 0]);
+        let (plain, _) = mesh(&lit);
+        assert!(plain.caps.iter().all(MeshLayer::is_empty));
+
+        let mut assets = assets();
+        let (mesh, _) = Mesher::new(&mut assets, Options { slice_caps: true, ..Default::default() }).build(&lit);
+        assert_eq!(mesh.opaque.indices, plain.opaque.indices);
+        let caps = &mesh.caps[Transparency::Opaque as usize];
+        assert_eq!(caps.indices.len() / 6, 1);
+        assert!(caps.vertices.iter().all(|v| v.block_y == 0 && v.position[1] == 1.0 && v.ao == 1.0));
+        let top: Vec<i32> = mesh.opaque.vertices.iter().filter(|v| v.position[1] == 2.0).map(|v| v.block_y).collect();
+        assert!(!top.is_empty() && top.iter().all(|&y| y == 1));
+    }
+
+    #[test]
+    fn chunked_fill_matches_a_single_build() {
+        let palette = vec![state("air", &[]), state("stone", &[]), state("glass", &[])];
+        let lit = schematic(Vec3i { x: 3, y: 2, z: 1 }, palette, vec![1, 0, 2, 1, 1, 2]);
+        let (whole, _) = mesh(&lit);
+
+        let mut assets = assets();
+        let mut build = Mesher::new(&mut assets, Options::default()).prepare(&lit);
+        let mut chunks = Vec::new();
+        loop {
+            let mut chunk = Mesh::default();
+            let more = build.fill(&lit, &mut chunk, 4);
+            chunks.push(chunk);
+            if !more {
+                break;
+            }
+        }
+        assert!(chunks.len() > 1);
+        assert_eq!(build.progress(), 1.0);
+        assert_eq!(chunks.last().unwrap().bounds, whole.bounds);
+        let vertices = |layer: fn(&Mesh) -> &MeshLayer| -> Vec<Vertex> {
+            chunks.iter().flat_map(|c| layer(c).vertices.clone()).collect()
+        };
+        assert_eq!(vertices(|m| &m.opaque), whole.opaque.vertices);
+        assert_eq!(vertices(|m| &m.cutout), whole.cutout.vertices);
+        assert_eq!(build.finish().0.rects, whole.atlas.unwrap().rects);
     }
 
     #[test]

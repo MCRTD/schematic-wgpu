@@ -44,6 +44,7 @@ fn main() {
                 uv: [uv.x as f32, 1.0 - uv.y as f32],
                 color: [255; 4],
                 ao: 1.0,
+                block_y: position[1].floor() as i32,
             });
         }
         for k in 1..face.num_indices - 1 {
@@ -67,6 +68,7 @@ fn main() {
             mip_levels: 1,
         }),
         bounds: [min, max],
+        caps: Default::default(),
     };
 
     let mut camera = viewer::OrbitCamera { yaw: yaw.to_radians(), ..Default::default() };

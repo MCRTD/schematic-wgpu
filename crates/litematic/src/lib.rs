@@ -22,6 +22,8 @@ pub enum Error {
     PaletteIndex { region: String, index: u32, len: usize },
     #[error("region `{region}`: block state array too short ({got} longs, need {need})")]
     ShortBlockStates { region: String, got: usize, need: usize },
+    #[error("region `{region}` is too large to load ({x}×{y}×{z} blocks)")]
+    TooLarge { region: String, x: i32, y: i32, z: i32 },
     #[error("invalid preview: {0}")]
     Preview(String),
 }
@@ -127,10 +129,19 @@ impl Region {
             z: min(raw.position.z, raw.size.z),
         };
 
-        let volume = size.x as usize * size.y as usize * size.z as usize;
         let bits = bits_per_entry(raw.block_state_palette.len());
+        // On 32-bit targets (wasm) a huge region would overflow these sizes
+        // or the block array; report it instead.
+        let volume = (size.x as usize)
+            .checked_mul(size.y as usize)
+            .and_then(|v| v.checked_mul(size.z as usize))
+            .filter(|v| v.checked_mul(size_of::<u32>()).is_some_and(|b| b <= isize::MAX as usize))
+            .and_then(|v| Some((v, v.checked_mul(bits as usize)?)));
+        let Some((volume, volume_bits)) = volume else {
+            return Err(Error::TooLarge { region: name, x: size.x, y: size.y, z: size.z });
+        };
         let longs: &[i64] = &raw.block_states;
-        let need = (volume * bits as usize).div_ceil(64);
+        let need = volume_bits.div_ceil(64);
         if longs.len() < need {
             return Err(Error::ShortBlockStates { region: name, got: longs.len(), need });
         }
@@ -159,20 +170,17 @@ impl Region {
         in_bounds.then(|| &self.palette[self.blocks[self.index(x, y, z)] as usize])
     }
 
+    /// Local position of `blocks[i]`; the inverse of [`Region::index`].
+    pub fn position(&self, i: usize) -> Vec3i {
+        let (sx, sz) = (self.size.x as usize, self.size.z as usize);
+        Vec3i { x: (i % sx) as i32, z: ((i / sx) % sz) as i32, y: (i / (sx * sz)) as i32 }
+    }
+
     /// Iterate over all non-air blocks as `(local position, state)`.
     pub fn iter_blocks(&self) -> impl Iterator<Item = (Vec3i, &BlockState)> {
-        let (sx, sz) = (self.size.x as usize, self.size.z as usize);
         self.blocks.iter().enumerate().filter_map(move |(i, &p)| {
             let state = &self.palette[p as usize];
-            if state.is_air() {
-                return None;
-            }
-            let pos = Vec3i {
-                x: (i % sx) as i32,
-                z: ((i / sx) % sz) as i32,
-                y: (i / (sx * sz)) as i32,
-            };
-            Some((pos, state))
+            (!state.is_air()).then(|| (self.position(i), state))
         })
     }
 }
