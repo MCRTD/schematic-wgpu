@@ -10,7 +10,7 @@ description = "Write meshes as glTF/GLB and OBJ"
 [dependencies]
 flate2 = "1.1.10"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
-mesher = { package = "schematic-wgpu-mesher", version = "0.2.0", path = "../mesher" }
+mesher = { package = "schematic-wgpu-mesher", version = "0.2.1", path = "../mesher" }
 serde_json = "1.0.151"
 
 [dev-dependencies]
@@ -18,4 +18,4 @@ glam = "0.33.10"
 gltf = { version = "1.4.1", features = ["import"] }
 pollster = "1.0.1"
 ufbx = "0.11.4"
-viewer = { package = "schematic-wgpu-viewer", version = "0.2.0", path = "../viewer" }
+viewer = { package = "schematic-wgpu-viewer", version = "0.2.1", path = "../viewer" }
