@@ -10,7 +10,7 @@ use glam::Vec3;
 use mesher::{Atlas, Mesh};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -166,6 +166,15 @@ struct Drag {
     orbit: bool,
     pan: bool,
     last: Option<PhysicalPosition<f64>>,
+    /// Active touch points (id, position): one finger orbits, two pinch-zoom and pan.
+    touches: Vec<(u64, PhysicalPosition<f64>)>,
+}
+
+/// Midpoint and spread of the first two touches.
+fn pinch(touches: &[(u64, PhysicalPosition<f64>)]) -> Option<(PhysicalPosition<f64>, f64)> {
+    let [(_, a), (_, b), ..] = touches else { return None };
+    let mid = PhysicalPosition::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
+    Some((mid, (a.x - b.x).hypot(a.y - b.y)))
 }
 
 pub struct Viewer {
@@ -360,6 +369,32 @@ impl ApplicationHandler<UserEvent> for Viewer {
                 };
                 self.camera.zoom(steps);
                 self.redraw();
+            }
+            WindowEvent::Touch(touch) => {
+                let before = pinch(&self.drag.touches);
+                let index = self.drag.touches.iter().position(|(id, _)| *id == touch.id);
+                match (touch.phase, index) {
+                    (TouchPhase::Started, None) => self.drag.touches.push((touch.id, touch.location)),
+                    (TouchPhase::Moved, Some(i)) => {
+                        let last = std::mem::replace(&mut self.drag.touches[i].1, touch.location);
+                        if self.drag.touches.len() == 1 {
+                            let (dx, dy) = ((touch.location.x - last.x) as f32, (touch.location.y - last.y) as f32);
+                            self.camera.orbit(dx, dy);
+                            gpu.window.request_redraw();
+                        } else if let (Some((m0, d0)), Some((m1, d1))) = (before, pinch(&self.drag.touches)) {
+                            self.camera.pan((m1.x - m0.x) as f32, (m1.y - m0.y) as f32, gpu.config.height as f32);
+                            if d0 > 1.0 && d1 > 1.0 {
+                                // zoom() scales distance by 0.9^steps; match the finger spread.
+                                self.camera.zoom(((d1 / d0).ln() / (1.0f64 / 0.9).ln()) as f32);
+                            }
+                            gpu.window.request_redraw();
+                        }
+                    }
+                    (TouchPhase::Ended | TouchPhase::Cancelled, Some(i)) => {
+                        self.drag.touches.remove(i);
+                    }
+                    _ => {}
+                }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let reframe = matches!(event.logical_key.as_ref(), Key::Character("r" | "R") | Key::Named(NamedKey::Home));
