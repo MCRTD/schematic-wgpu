@@ -177,7 +177,9 @@ pub fn is_block_asset(path: &str) -> bool {
     let Some(rest) = path.strip_prefix("assets/") else { return false };
     let Some((_, rest)) = rest.split_once('/') else { return false };
     let texture = rest.ends_with(".png") || rest.ends_with(".mcmeta");
-    rest.starts_with("blockstates/")
+    // GeckoLib block models; see `Assets::geo_model`.
+    let geo = rest.strip_prefix("geo/").is_some_and(|g| g.ends_with(".geo.json") && !g.contains("entity/") && !g.contains("item/"));
+    geo || rest.starts_with("blockstates/")
         || rest.starts_with("models/block/")
         || (texture && rest.starts_with("textures/block/"))
         || (texture && rest.strip_prefix("textures/entity/").is_some_and(|e| BLOCK_ENTITY_TEXTURES.iter().any(|p| e.starts_with(p))))

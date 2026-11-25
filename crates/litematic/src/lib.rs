@@ -1,9 +1,11 @@
-//! Parser for Litematica `.litematic` files.
+//! Parser for Litematica `.litematic` files and vanilla structure `.nbt`
+//! files (also used by the Create mod's schematics).
 //!
 //! A `.litematic` file is a gzip-compressed NBT compound. Each region stores a
 //! block-state palette plus a tightly packed `long[]` of palette indices.
 
 mod preview;
+mod structure;
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -223,8 +225,26 @@ pub struct Litematic {
 }
 
 impl Litematic {
+    /// Read a `.litematic` or structure `.nbt` file; see [`Litematic::from_bytes`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::from_gzip_bytes(&std::fs::read(path)?)
+        Self::from_bytes(&std::fs::read(path)?)
+    }
+
+    /// Parse a `.litematic` or a structure `.nbt` file (as saved by structure
+    /// blocks or Create's schematic table), gzip-compressed or not.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut unzipped = Vec::new();
+        let nbt = if bytes.starts_with(&[0x1f, 0x8b]) {
+            GzDecoder::new(bytes).read_to_end(&mut unzipped)?;
+            &unzipped[..]
+        } else {
+            bytes
+        };
+        if structure::is_structure(nbt) {
+            Self::from_structure_nbt_bytes(nbt)
+        } else {
+            Self::from_nbt_bytes(nbt)
+        }
     }
 
     /// Parse a gzip-compressed `.litematic` file.
@@ -248,6 +268,22 @@ impl Litematic {
             metadata: raw.metadata,
             regions,
         })
+    }
+}
+
+impl Litematic {
+    /// Namespaces of the mod blocks used, e.g. `create`, each with the name
+    /// of one block from it. Vanilla `minecraft` blocks are left out.
+    pub fn mod_namespaces(&self) -> BTreeMap<&str, &str> {
+        let mut found = BTreeMap::new();
+        for state in self.regions.iter().flat_map(|r| &r.palette) {
+            if let Some((ns, name)) = state.name.split_once(':') {
+                if ns != "minecraft" {
+                    found.entry(ns).or_insert(name);
+                }
+            }
+        }
+        found
     }
 }
 

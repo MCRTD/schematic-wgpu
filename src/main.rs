@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use litematic::Litematic;
 
 #[derive(Parser)]
-#[command(name = "schematic", version, about = "Convert Litematica schematics to 3D models")]
+#[command(name = "schematic", version, about = "Convert Litematica and structure/Create (.nbt) schematics to 3D models")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -13,14 +13,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Decode a .litematic file to JSON
+    /// Decode a .litematic or .nbt file to JSON
     Decode {
         litematic: PathBuf,
         /// Output file (defaults to <input>.json)
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-    /// Print a summary of a .litematic file
+    /// Print a summary of a .litematic or .nbt file
     Info { litematic: PathBuf },
     /// Build the 3D mesh and report statistics and unsupported blocks
     Mesh {
@@ -29,7 +29,7 @@ enum Command {
         #[arg(short, long = "pack", required = true)]
         packs: Vec<PathBuf>,
     },
-    /// Export a .litematic file as .glb, .gltf, .obj or .fbx
+    /// Export a .litematic or .nbt file as .glb, .gltf, .obj or .fbx
     Export {
         litematic: PathBuf,
         /// Resource packs or mods (folder, .zip, client .jar or mod .jar), highest priority first
@@ -49,7 +49,7 @@ enum Command {
         #[arg(short, long = "pack", required = true)]
         packs: Vec<PathBuf>,
     },
-    /// Render a .litematic file to a PNG image on the GPU
+    /// Render a .litematic or .nbt file to a PNG image on the GPU
     Render {
         litematic: PathBuf,
         /// Resource packs or mods (folder, .zip, client .jar or mod .jar), highest priority first

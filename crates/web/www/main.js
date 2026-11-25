@@ -1,4 +1,4 @@
-import init, { App, load_vanilla, minecraft_versions } from "./pkg/web.js";
+import init, { App, load_mod, load_vanilla, minecraft_versions } from "./pkg/web.js";
 
 // Rust panics are reported with a JS stack; the default 10 frames stop
 // before the frame that caused them.
@@ -173,16 +173,47 @@ async function loadVersion(version) {
   ui.version.disabled = false;
 }
 
+// Mods a schematic needs (e.g. Create for its `create:` blocks) are fetched
+// from Modrinth when no added pack has them. They go below the user's packs,
+// so resource packs still win.
+const modRequests = new Map();
+async function loadMissingMods() {
+  const version = ui.version.value;
+  if (!haveVanilla || !version) return;
+  for (const namespace of app.missing_namespaces) {
+    const key = `${namespace}@${version}`;
+    if (!modRequests.has(key)) {
+      modRequests.set(key, load_mod(namespace, version, (msg) => status(msg)));
+    }
+    let assets;
+    try {
+      assets = await modRequests.get(key);
+    } catch (e) {
+      console.warn(e);
+      status(`Couldn't get ${namespace} from Modrinth (${e.message ?? e}); add its mod .jar to show those blocks.`, true);
+      continue;
+    }
+    // Something else may have added it meanwhile.
+    if (!app.missing_namespaces.includes(namespace)) continue;
+    await changePacks(() => {
+      app.add_mod(assets);
+      return app.move_pack(0, app.packs.length - 1);
+    });
+    status(`Added ${assets.name} from Modrinth (${assets.files} block assets).`);
+  }
+}
+
 async function openFiles(files) {
   for (const file of files) {
     const bytes = new Uint8Array(await file.arrayBuffer());
-    if (/\.litematic$/i.test(file.name)) {
+    if (/\.(litematic|nbt)$/i.test(file.name)) {
       await attempt(() => {
         const report = app.load_schematic(bytes);
         if (!haveVanilla && app.packs.length === 0)
           status("Schematic loaded; waiting for block assets…");
         return report;
       });
+      await loadMissingMods();
     } else if (/\.(zip|jar)$/i.test(file.name)) {
       await changePacks(() => app.add_pack(file.name, bytes));
     } else {
@@ -200,7 +231,7 @@ ui.file.addEventListener("change", () => openFiles(ui.file.files));
 ui.addPack.addEventListener("click", () => ui.packFile.click());
 ui.packFile.addEventListener("change", () => openFiles(ui.packFile.files));
 ui.clearPacks.addEventListener("click", () => changePacks(() => app.clear_packs()));
-ui.version.addEventListener("change", () => loadVersion(ui.version.value));
+ui.version.addEventListener("change", () => loadVersion(ui.version.value).then(loadMissingMods));
 ui.layer.addEventListener("input", showLayer);
 ui.time.addEventListener("change", () => app.set_time(ui.time.value));
 ui.canvas.addEventListener("keydown", (e) => {
@@ -252,4 +283,6 @@ try {
 if (versions) {
   ui.version.replaceChildren(...versions.map((v) => new Option(v, v)));
   await loadVersion(versions[0]);
+  // A schematic opened while the version was loading.
+  await loadMissingMods();
 }

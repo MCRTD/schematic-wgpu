@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use litematic::Litematic;
 use mc_assets::remote_zip::{self, TAIL_LEN};
-use mc_assets::{Assets, MemorySource, PackStack, ZipSource};
+use mc_assets::{AssetSource, Assets, MemorySource, PackStack, ZipSource};
 use mesher::{Mesh, Mesher};
 use serde::Deserialize;
 use viewer::app::UserEvent;
@@ -20,6 +20,7 @@ use wasm_bindgen::prelude::*;
 use winit::event_loop::EventLoopProxy;
 
 const MANIFEST_URL: &str = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
+const MODRINTH_API: &str = "https://api.modrinth.com/v2";
 /// Oldest release offered: Litematica exists from 1.13, but 1.14 is where
 /// the block asset layout settles into its current form.
 const OLDEST_VERSION: &str = "1.14";
@@ -162,27 +163,176 @@ pub async fn load_vanilla(version: String, progress: js_sys::Function) -> Result
     let info: VersionInfo =
         serde_json::from_str(&text(&entry.url, true).await?).map_err(|e| JsError::new(&e.to_string()))?;
     let Download { url, size } = info.downloads.client;
+    let (files, downloaded) = remote_block_assets(&url, size, &format!("the {version} client jar"), None, &report)
+        .await?
+        .ok_or_else(|| JsError::new("client jar has no block assets"))?;
+    Ok(VanillaAssets { version, source: Arc::new(remote_zip::into_source(files)), downloaded })
+}
 
+/// Fetch only the block assets of the zip at `url` with range requests.
+/// Returns the files and how many bytes were fetched, or `None` if no file
+/// starts with `require`, found from the zip's index alone.
+async fn remote_block_assets(
+    url: &str,
+    size: u64,
+    label: &str,
+    require: Option<&str>,
+    report: &dyn Fn(String),
+) -> Result<Option<(Vec<(String, Vec<u8>)>, u64)>, JsError> {
     let mut downloaded = 0;
-    report(format!("Reading the {version} client jar index…"));
+    report(format!("Reading the index of {label}…"));
     let tail = size.saturating_sub(TAIL_LEN)..size;
     downloaded += tail.end - tail.start;
-    let cd = remote_zip::locate_central_directory(&range(&url, tail).await?, size)?;
+    let cd = remote_zip::locate_central_directory(&range(url, tail).await?, size)?;
     downloaded += cd.end - cd.start;
-    let entries = remote_zip::parse_central_directory(&range(&url, cd.clone()).await?)?;
+    let entries = remote_zip::parse_central_directory(&range(url, cd.clone()).await?)?;
+    if let Some(prefix) = require
+        && !entries.iter().any(|e| e.name.starts_with(prefix))
+    {
+        return Ok(None);
+    }
 
     let spans = remote_zip::plan(&entries, cd.start, 64 * 1024, remote_zip::is_block_asset);
     let total: u64 = spans.iter().map(|s| s.range.end - s.range.start).sum();
     let mut files = Vec::new();
     let mut done = 0;
     for span in &spans {
-        report(format!("Downloading {version} block assets… {:.1} / {:.1} MB", done as f64 / 1e6, total as f64 / 1e6));
-        let data = range(&url, span.range.clone()).await?;
+        report(format!("Downloading block assets of {label}… {:.1} / {:.1} MB", done as f64 / 1e6, total as f64 / 1e6));
+        let data = range(url, span.range.clone()).await?;
         files.extend(remote_zip::extract(span, &data)?);
         done += span.range.end - span.range.start;
     }
-    downloaded += done;
-    Ok(VanillaAssets { version, source: Arc::new(remote_zip::into_source(files)), downloaded })
+    Ok(Some((files, downloaded + done)))
+}
+
+#[derive(Deserialize)]
+struct ModrinthVersion {
+    version_number: String,
+    files: Vec<ModrinthFile>,
+}
+
+#[derive(Deserialize)]
+struct ModrinthFile {
+    url: String,
+    size: u64,
+    #[serde(default)]
+    primary: bool,
+}
+
+/// Block assets of a mod, fetched from Modrinth.
+#[wasm_bindgen]
+pub struct ModAssets {
+    name: String,
+    source: Arc<MemorySource>,
+    downloaded: u64,
+}
+
+#[wasm_bindgen]
+impl ModAssets {
+    /// E.g. `create 6.0.10+mc1.21.1`.
+    #[wasm_bindgen(getter)]
+    pub fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn files(&self) -> usize {
+        self.source.files.len()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn downloaded(&self) -> f64 {
+        self.downloaded as f64
+    }
+}
+
+/// Whether `s` can be a namespace, so it is safe to put in a URL.
+fn is_namespace(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'.'))
+}
+
+/// Namespaces whose Modrinth project has a quite different name, which a
+/// search for the namespace doesn't find.
+const MODRINTH_ALIASES: &[(&str, &str)] = &[
+    ("sfm", "super-factory-manager"),
+    ("extendedae", "extended-ae"),
+    ("immersiveengineering", "immersive-engineering"),
+    ("thermal", "thermal-expansion"),
+];
+
+#[derive(Deserialize)]
+struct ModrinthSearch {
+    hits: Vec<ModrinthHit>,
+}
+
+#[derive(Deserialize)]
+struct ModrinthHit {
+    slug: String,
+}
+
+fn json<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, JsError> {
+    serde_json::from_str(text).map_err(|e| JsError::new(&e.to_string()))
+}
+
+/// Modrinth projects that may have the blocks of `namespace`, likeliest first.
+async fn modrinth_candidates(namespace: &str, version: &str) -> Vec<String> {
+    let mut slugs: Vec<String> =
+        MODRINTH_ALIASES.iter().filter(|(ns, _)| *ns == namespace).map(|(_, s)| s.to_string()).collect();
+    slugs.push(namespace.to_owned());
+    slugs.push(namespace.replace('_', "-"));
+    let facets = js_sys::encode_uri_component(&format!("[[\"project_type:mod\"],[\"versions:{version}\"]]"));
+    for query in [namespace.replace('_', " "), namespace.to_owned()] {
+        let query = js_sys::encode_uri_component(&query);
+        let url = format!("{MODRINTH_API}/search?query={query}&limit=5&facets={facets}");
+        if let Ok(found) = async { json::<ModrinthSearch>(&text(&url, false).await?) }.await {
+            slugs.extend(found.hits.into_iter().map(|h| h.slug));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    slugs.retain(|s| seen.insert(s.clone()));
+    slugs
+}
+
+/// Fetch the block assets of the mod whose blocks use `namespace` (e.g.
+/// `create`) from Modrinth. Its project may be named differently
+/// (`ars_nouveau` is `ars-nouveau`), so aliases, slugs and search results
+/// are tried, and a project is only taken if its jar's index has blocks in
+/// that namespace. Takes the newest release for Minecraft `version`, or the
+/// newest of all if there is none for it.
+#[wasm_bindgen]
+pub async fn load_mod(namespace: String, version: String, progress: js_sys::Function) -> Result<ModAssets, JsError> {
+    let report = |msg: String| {
+        let _ = progress.call1(&JsValue::NULL, &msg.into());
+    };
+    if !is_namespace(&namespace) {
+        return Err(JsError::new(&format!("invalid namespace {namespace}")));
+    }
+    report(format!("Looking up {namespace} on Modrinth…"));
+    let prefix = format!("assets/{namespace}/blockstates/");
+    for slug in modrinth_candidates(&namespace, &version).await {
+        if !is_namespace(&slug) {
+            continue;
+        }
+        let versions = |filter: String| {
+            let url = format!("{MODRINTH_API}/project/{slug}/version{filter}");
+            async move { json::<Vec<ModrinthVersion>>(&text(&url, false).await?) }
+        };
+        let filter = format!("?game_versions={}", js_sys::encode_uri_component(&format!("[\"{version}\"]")));
+        let Ok(mut list) = versions(filter).await else { continue };
+        if list.is_empty() {
+            list = versions(String::new()).await.unwrap_or_default();
+        }
+        let found = list.into_iter().find_map(|v| {
+            let file = v.files.iter().position(|f| f.primary).unwrap_or(0);
+            v.files.into_iter().nth(file).map(|f| (v.version_number, f))
+        });
+        let Some((number, file)) = found else { continue };
+        let name = format!("{slug} {number}");
+        if let Some((files, downloaded)) = remote_block_assets(&file.url, file.size, &name, Some(&prefix), &report).await? {
+            return Ok(ModAssets { name, source: Arc::new(remote_zip::into_source(files)), downloaded });
+        }
+    }
+    Err(JsError::new(&format!("no mod on Modrinth has {namespace} blocks")))
 }
 
 /// Faces meshed and uploaded at a time, about 100 MB of mesh. A wasm page
@@ -199,10 +349,10 @@ struct Shutdown {
     waiting: Vec<js_sys::Function>,
 }
 
-/// A resource pack or mod jar added by the user.
+/// A resource pack or mod jar added by the user, or a mod from Modrinth.
 struct Pack {
     name: String,
-    source: Arc<ZipSource<Cursor<Vec<u8>>>>,
+    source: Arc<dyn AssetSource>,
 }
 
 #[derive(Default)]
@@ -233,6 +383,20 @@ impl State {
             stack.push(vanilla.clone());
         }
         Some(Assets::new(stack))
+    }
+
+    /// Namespaces of mod blocks in the schematic that no pack has a
+    /// blockstate for.
+    fn missing_namespaces(&self) -> Vec<String> {
+        let Some(lit) = &self.schematic else { return Vec::new() };
+        lit.mod_namespaces()
+            .into_iter()
+            .filter(|(ns, block)| {
+                let path = format!("assets/{ns}/blockstates/{block}.json");
+                !self.packs.iter().any(|p| p.source.read(&path).is_some())
+            })
+            .map(|(ns, _)| ns.to_string())
+            .collect()
     }
 }
 
@@ -312,9 +476,23 @@ impl App {
     /// Add a resource pack zip, or a mod jar for its blocks, on top of the
     /// others. `name` is only for [`App::packs`].
     pub fn add_pack(&self, name: String, zip: Vec<u8>) -> Result<js_sys::Promise, JsError> {
-        let source = Arc::new(ZipSource::from_bytes(zip)?);
+        let source: Arc<ZipSource<Cursor<Vec<u8>>>> = Arc::new(ZipSource::from_bytes(zip)?);
         self.state.borrow_mut().packs.insert(0, Pack { name, source });
         Ok(self.rebuild())
+    }
+
+    /// Add a mod fetched with [`load_mod`] on top of the other packs.
+    pub fn add_mod(&self, assets: &ModAssets) -> js_sys::Promise {
+        let pack = Pack { name: assets.name.clone(), source: assets.source.clone() };
+        self.state.borrow_mut().packs.insert(0, pack);
+        self.rebuild()
+    }
+
+    /// Namespaces of mod blocks in the shown schematic, e.g. `create`, that
+    /// none of the added packs has; see [`load_mod`].
+    #[wasm_bindgen(getter)]
+    pub fn missing_namespaces(&self) -> Vec<String> {
+        self.state.borrow().missing_namespaces()
     }
 
     /// Names of the added packs, highest priority first: where several have
@@ -353,9 +531,9 @@ impl App {
         self.rebuild()
     }
 
-    /// Show a `.litematic` file.
+    /// Show a `.litematic` or structure `.nbt` (e.g. Create schematic) file.
     pub fn load_schematic(&self, bytes: &[u8]) -> Result<js_sys::Promise, JsError> {
-        self.state.borrow_mut().schematic = Some(Rc::new(Litematic::from_gzip_bytes(bytes)?));
+        self.state.borrow_mut().schematic = Some(Rc::new(Litematic::from_bytes(bytes)?));
         Ok(self.rebuild())
     }
 

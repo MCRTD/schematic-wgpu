@@ -122,10 +122,123 @@ impl RawTextureRef {
 pub(crate) struct RawModel {
     pub parent: Option<String>,
     #[serde(rename = "ambientocclusion")]
-    ambient_occlusion: Option<bool>,
+    pub ambient_occlusion: Option<bool>,
     #[serde(default)]
     textures: HashMap<String, RawTextureRef>,
     elements: Option<Vec<RawElement>>,
+    /// A (Neo)Forge model loader, e.g. `neoforge:obj` or `forge:composite`.
+    pub loader: Option<String>,
+    /// The `.obj` file of an OBJ model, e.g. `create:models/block/x.obj`.
+    pub model: Option<String>,
+    /// OBJ models: flip texture V, as Blender exports need.
+    pub flip_v: Option<bool>,
+    /// Composite models: named sub-models, each drawn in full.
+    #[serde(alias = "parts")]
+    pub children: Option<HashMap<String, RawModel>>,
+}
+
+/// A face of an OBJ model, before its texture reference is resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RawPolygon {
+    positions: [[f32; 3]; 4],
+    uvs: [[f32; 2]; 4],
+    /// Texture reference from the material, usually `#name`.
+    texture: String,
+}
+
+/// A free-form face of an OBJ model. Triangles repeat their last corner.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Polygon {
+    /// Corners in 0..16 model space, counter-clockwise seen from the front.
+    pub positions: [[f32; 3]; 4],
+    /// UVs in 0..16 texel space.
+    pub uvs: [[f32; 2]; 4],
+    pub texture: Option<String>,
+}
+
+/// Parse a Wavefront `.obj` file in block units, as (Neo)Forge's OBJ loader
+/// reads it. `mtl` returns the text of a material library the file names;
+/// each material's `map_Kd` is the face's texture reference.
+pub(crate) fn parse_obj(obj: &str, mtl: impl Fn(&str) -> Option<String>, flip_v: bool) -> Vec<RawPolygon> {
+    let mut materials: HashMap<String, String> = HashMap::new();
+    let (mut positions, mut uvs) = (Vec::<[f32; 3]>::new(), Vec::<[f32; 2]>::new());
+    // Faces before any `usemtl` have no material, e.g. helper boxes left in
+    // an export; (Neo)Forge doesn't draw them.
+    let mut texture: Option<String> = None;
+    let mut polygons = Vec::new();
+    let floats = |rest: std::str::SplitWhitespace| rest.filter_map(|t| t.parse::<f32>().ok()).collect::<Vec<_>>();
+    for line in obj.lines() {
+        let mut parts = line.split_whitespace();
+        match parts.next() {
+            Some("mtllib") => {
+                let name = parts.collect::<Vec<_>>().join(" ");
+                let Some(text) = mtl(&name) else { continue };
+                let mut current = None;
+                for line in text.lines() {
+                    let mut parts = line.split_whitespace();
+                    match parts.next() {
+                        Some("newmtl") => current = parts.next().map(str::to_owned),
+                        Some("map_Kd") => {
+                            if let (Some(name), Some(map)) = (&current, parts.next()) {
+                                materials.insert(name.clone(), map.to_owned());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some("usemtl") => {
+                let name = parts.next().unwrap_or_default();
+                texture = Some(materials.get(name).cloned().unwrap_or_else(|| format!("#{name}")));
+            }
+            Some("v") => {
+                if let [x, y, z, ..] = floats(parts)[..] {
+                    positions.push([x * 16.0, y * 16.0, z * 16.0]);
+                }
+            }
+            Some("vt") => {
+                if let [u, v, ..] = floats(parts)[..] {
+                    let v = if flip_v { 1.0 - v } else { v };
+                    uvs.push([u * 16.0, v * 16.0]);
+                }
+            }
+            Some("f") => {
+                let Some(texture) = &texture else { continue };
+                // `v`, `v/vt`, `v/vt/vn` or `v//vn`; indices are 1-based or negative.
+                let index = |i: Option<&str>, len: usize| -> Option<usize> {
+                    let i: i64 = i?.parse().ok()?;
+                    let i = if i < 0 { len as i64 + i } else { i - 1 };
+                    usize::try_from(i).ok().filter(|&i| i < len)
+                };
+                let corners: Option<Vec<([f32; 3], [f32; 2])>> = parts
+                    .map(|c| {
+                        let mut ids = c.split('/');
+                        let p = positions[index(ids.next(), positions.len())?];
+                        let uv = index(ids.next(), uvs.len()).map_or([0.0; 2], |i| uvs[i]);
+                        Some((p, uv))
+                    })
+                    .collect();
+                let Some(corners) = corners.filter(|c| c.len() >= 3) else { continue };
+                // Quads stay whole; other polygons become a fan of triangles.
+                let mut push = |c: [usize; 4]| {
+                    polygons.push(RawPolygon {
+                        positions: c.map(|i| corners[i].0),
+                        uvs: c.map(|i| corners[i].1),
+                        texture: texture.clone(),
+                    })
+                };
+                if corners.len() == 4 {
+                    push([0, 1, 2, 3]);
+                } else {
+                    for i in 1..corners.len() - 1 {
+                        push([0, i, i + 1, i + 1]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    polygons
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -166,6 +279,8 @@ impl Element {
 pub struct Model {
     pub ambient_occlusion: bool,
     pub elements: Vec<Element>,
+    /// Faces of OBJ models.
+    pub polygons: Vec<Polygon>,
 }
 
 /// Normalize `stone`, `block/stone` or `minecraft:block/stone` to
@@ -179,7 +294,7 @@ pub fn qualify(location: &str) -> String {
 }
 
 /// Flatten a chain of models, child first, into a resolved [`Model`].
-pub(crate) fn flatten(chain: &[RawModel]) -> Model {
+pub(crate) fn flatten(chain: &[RawModel], polygons: &[RawPolygon]) -> Model {
     // Children override parents, so apply texture maps from the root down.
     let mut textures: HashMap<&str, &str> = HashMap::new();
     for m in chain.iter().rev() {
@@ -225,7 +340,11 @@ pub(crate) fn flatten(chain: &[RawModel]) -> Model {
             Element { from: e.from, to: e.to, rotation: e.rotation.clone(), shade: e.shade, faces }
         })
         .collect();
-    Model { ambient_occlusion, elements }
+    let polygons = polygons
+        .iter()
+        .map(|p| Polygon { positions: p.positions, uvs: p.uvs, texture: resolve(&p.texture) })
+        .collect();
+    Model { ambient_occlusion, elements, polygons }
 }
 
 #[cfg(test)]
@@ -247,7 +366,7 @@ mod tests {
         let column = raw(r##"{"parent": "block/cube", "textures": {"up": "#end", "side": "#end"}}"##);
         let log = raw(r#"{"parent": "block/cube_column", "textures": {"end": "block/oak_log_top", "side": "block/oak_log"}}"#);
 
-        let model = flatten(&[log, column, cube]);
+        let model = flatten(&[log, column, cube], &[]);
         assert!(model.ambient_occlusion);
         let e = &model.elements[0];
         assert!(e.is_full_cube());
@@ -269,9 +388,28 @@ mod tests {
                     "up": {"texture": "#a"}, "down": {"texture": "#missing"}, "east": {"texture": "#s"}
                 }}]}"##,
         );
-        let model = flatten(&[m]);
+        let model = flatten(&[m], &[]);
         let textures: Vec<_> = model.elements[0].faces.iter().map(|f| f.texture.clone()).collect();
         assert_eq!(textures, [None, None, Some("foo:block/x".into())]);
         assert!(!model.elements[0].is_full_cube());
+    }
+
+    #[test]
+    fn obj_faces_use_material_textures() {
+        let obj = "mtllib wheel.mtl\nv 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nv 0.5 2 0\nvt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\n\
+                   o Helper\nf 1 2 3\nusemtl metal\nf 1/1 2/2 3/3 4/4\nusemtl unknown\nf 4/4 3/3 -1\n";
+        let mtl = |name: &str| (name == "wheel.mtl").then(|| "newmtl metal\nmap_Kd #plates\n".to_string());
+        let polygons = parse_obj(obj, mtl, true);
+        assert_eq!(polygons.len(), 2);
+        assert_eq!(polygons[0].positions[2], [16.0, 16.0, 0.0]);
+        // Flipped V: the third corner had v = 1.
+        assert_eq!(polygons[0].uvs[2], [16.0, 0.0]);
+        // A triangle repeats its last corner.
+        assert_eq!(polygons[1].positions[3], [8.0, 32.0, 0.0]);
+
+        let model = raw(r##"{"textures": {"plates": "create:block/plates"}}"##);
+        let model = flatten(&[model], &polygons);
+        assert_eq!(model.polygons[0].texture.as_deref(), Some("create:block/plates"));
+        assert_eq!(model.polygons[1].texture, None);
     }
 }

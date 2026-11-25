@@ -154,6 +154,23 @@ pub fn bake(instance: &ModelInstance) -> Vec<Quad> {
             });
         }
     }
+
+    for polygon in &instance.model.polygons {
+        let positions = polygon.positions.map(|p| block_rotation * (Vec3::from(p) - center) + center);
+        let normal = (positions[1] - positions[0]).cross(positions[2] - positions[0]);
+        if normal.length_squared() < 1e-12 {
+            continue;
+        }
+        quads.push(Quad {
+            positions: positions.map(|p| p / 16.0),
+            uvs: polygon.uvs.map(|[u, v]| [u / 16.0, v / 16.0]),
+            normal: normal.normalize(),
+            cullface: None,
+            texture: polygon.texture.clone(),
+            tinted: false,
+            ambient_occlusion: instance.model.ambient_occlusion,
+        });
+    }
     quads
 }
 
@@ -176,7 +193,7 @@ mod tests {
 
     fn instance(elements: Vec<Element>, x: i32, y: i32, uvlock: bool) -> ModelInstance {
         ModelInstance {
-            model: Arc::new(Model { ambient_occlusion: true, elements }),
+            model: Arc::new(Model { ambient_occlusion: true, elements, ..Default::default() }),
             x,
             y,
             uvlock,

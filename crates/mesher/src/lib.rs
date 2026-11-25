@@ -4,6 +4,7 @@ pub mod atlas;
 pub mod bake;
 mod block_entity;
 mod light;
+mod partial;
 mod tint;
 
 use std::collections::{BTreeMap, HashMap};
@@ -367,7 +368,37 @@ impl<'a> Mesher<'a> {
         {
             vec![vec![(1, quads)]]
         } else {
-            let resolved = self.assets.resolve(&state.name, &state.properties).map(|parts| {
+            let resolved = self.assets.resolve(&state.name, &state.properties);
+            // Filler blocks such as Create's water wheel structure use the
+            // empty `block/air` model on purpose; they are invisible in game.
+            if let Ok(parts) = &resolved
+                && let Ok(air) = self.assets.model("minecraft:block/air")
+                && !parts.is_empty()
+                && parts.iter().flatten().all(|m| Arc::ptr_eq(&m.model, &air))
+            {
+                return BakedState { skip: true, ..Default::default() };
+            }
+            // Blocks drawn with GeckoLib have a placeholder block model; draw
+            // their `.geo.json` instead, turned like the placeholder and with
+            // its texture, which is the GeckoLib texture sheet.
+            let resolved = resolved.map(|parts| match parts.first().and_then(|p| p.first()) {
+                Some(first) => {
+                    let (ns, name) = state.name.split_once(':').unwrap_or(("minecraft", &state.name));
+                    let texture = first
+                        .model
+                        .elements
+                        .iter()
+                        .flat_map(|e| &e.faces)
+                        .find_map(|f| f.texture.clone())
+                        .unwrap_or_else(|| format!("{ns}:block/{name}"));
+                    match self.assets.geo_model(&state.name, &texture) {
+                        Some(model) => vec![vec![mc_assets::ModelInstance { model, ..first.clone() }]],
+                        None => parts,
+                    }
+                }
+                None => parts,
+            });
+            let resolved = resolved.map(|parts| {
                 parts
                     .iter()
                     .map(|choices| choices.iter().map(|m| (m.weight, bake::bake(m))).collect::<Vec<_>>())
@@ -391,6 +422,23 @@ impl<'a> Mesher<'a> {
                 }
             }
         };
+
+        // Parts the mod draws with code, from partial models in its jar.
+        let mut quads = quads;
+        for part in partial::parts(state) {
+            let Ok(model) = self.assets.model(&part.model) else { continue };
+            let instance = mc_assets::ModelInstance { model, x: part.x, y: part.y, uvlock: false, weight: 1 };
+            let moved = bake::bake(&instance)
+                .into_iter()
+                .map(|mut q| {
+                    q.positions = q.positions.map(|p| part.transform.transform_point3(p));
+                    q.normal = part.transform.transform_vector3(q.normal).normalize();
+                    q.cullface = None;
+                    q
+                })
+                .collect();
+            quads.push(vec![(1, moved)]);
+        }
 
         if quads.iter().flatten().all(|(_, quads)| quads.is_empty()) {
             reported = true;
@@ -720,7 +768,7 @@ fn cube_quads(height: f32, texture: Option<&str>) -> Vec<Quad> {
                 }],
             };
             let instance = mc_assets::ModelInstance {
-                model: Arc::new(mc_assets::Model { ambient_occlusion: true, elements: vec![element] }),
+                model: Arc::new(mc_assets::Model { ambient_occlusion: true, elements: vec![element], ..Default::default() }),
                 x: 0,
                 y: 0,
                 uvlock: false,
